@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarmlabs-engine-kit"
+version = "0.1.0"
+description = "Open-source client SDK, MCP server, and Skill catalog for the SwarmLabs physics-informed scientific experiment automation engine."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "SwarmLabs" }]
+keywords = [
+    "scientific-computing",
+    "physics-informed",
+    "multi-agent",
+    "experiment-automation",
+    "mcp",
+    "agent-infrastructure",
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/lm203688/swarmlabs-engine-kit"
+Repository = "https://github.com/lm203688/swarmlabs-engine-kit"
+
+[tool.setuptools.packages.find]
+where = ["src"]

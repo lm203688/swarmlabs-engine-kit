@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0",
+  "project": "SwarmLabs",
+  "description": "Core Skills composing the SwarmLabs multi-agent scientific experiment automation loop (Planner -> Executor -> Verifier).",
+  "skills": [
+    {
+      "id": "PhysicsPredictSkill",
+      "purpose": "Call the SwarmLabs real physics/mathematical model to complete a computation.",
+      "input": { "engine": "string", "params": "object", "model": "string?" },
+      "output": {
+        "result": "number",
+        "secondary_result": "number?",
+        "uncertainty": "number",
+        "epistemic_uncertainty": "number?",
+        "model": "string",
+        "empirical_validated": "number",
+        "literature_validated": "number",
+        "paper_reference": "string?"
+      },
+      "depends_on": ["SwarmLabs v2/run/{engine} API or MCP server"],
+      "safety": "Read-only computation; does not mutate external state; does not log sensitive parameters.",
+      "used_by": ["ExecutorAgent"]
+    },
+    {
+      "id": "ExperimentDesignSkill",
+      "purpose": "Generate an experiment design from a user goal.",
+      "input": { "goal": "string", "domain": "string?", "budget": "number?", "metrics": "string[]?" },
+      "output": {
+        "plan": "object",
+        "candidates": "array",
+        "parameter_ranges": "object",
+        "evaluation_metrics": "array",
+        "estimated_cost": "number",
+        "risk_level": "string"
+      },
+      "depends_on": ["ENGINE_CATEGORIES", "CATEGORY_PARAMS"],
+      "safety": "Read-only metadata query.",
+      "used_by": ["PlannerAgent"]
+    },
+    {
+      "id": "ActiveLearningSkill",
+      "purpose": "Active-learning sampling: pick the next most informative experiment point.",
+      "input": { "history": "array", "acquisition": "ucb|ei|pi" },
+      "output": { "next_params": "object", "expected_info_gain": "number", "uncertainty": "number" },
+      "depends_on": ["history database / in-memory store"],
+      "safety": "Read-only over history.",
+      "used_by": ["VerifierAgent"]
+    },
+    {
+      "id": "ReportGenerationSkill",
+      "purpose": "Generate an auditable experiment report.",
+      "input": { "trace": "array", "results": "array", "engine": "string", "params": "object" },
+      "output": { "markdown_report": "string", "json_trace": "object" },
+      "depends_on": ["template engine"],
+      "safety": "Does not emit secrets or internal implementation details.",
+      "used_by": ["VerifierAgent"]
+    }
+  ]
+}
