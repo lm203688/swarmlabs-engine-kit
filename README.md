@@ -37,9 +37,46 @@ an MCP-compatible agent runtime, or a no-code agent builder.
 |---|---|
 | `src/swarmlabs_engine/` | Python client SDK (`SwarmLabsClient`) |
 | `mcp/server.py` | Reference MCP server exposing engine calls as tools |
+| `mcp/vv_gate_server.py` | **Verification-gate MCP server** — ask "can this scenario be trusted right now?" |
 | `skills/skill_catalog.json` | Machine-readable catalog of the 4 core Skills |
 | `examples/quickstart.py` | Minimal end-to-end example |
 | `docs/API.md` | Endpoint reference |
+
+## The verification gate (why this kit exists in 2026)
+
+Frontier research agents now *generate* scientific results with no plugins and no
+fine-tuning — GPT-6 Astra topped Insilico Medicine's DDD antibody-developability
+benchmark (37.98) with none of either. Reviews of these agents are unanimous on the
+failure mode: *"prone to plausible-but-wrong outputs, weak guardrails."* The
+prescription is a **held-out benchmark + quantified uncertainty + a human checkpoint**.
+
+`mcp/vv_gate_server.py` is a runnable MCP server for that checkpoint. It is
+**HTTP-backed** — no engine, no numpy — and answers from the published,
+machine-readable endpoints:
+
+| MCP tool | Backed by |
+|---|---|
+| `list_scenarios`, `get_verdict_summary` | `GET https://swarmlabs.tools/v3/report-index` |
+| `gate_for_scenario`, `get_uncertainty_budget` | `GET https://swarmlabs.tools/v3/gate/{key}` |
+| `get_report` | `GET https://swarmlabs.tools/v3/report/{key}` · `/reports/html/{key}.html` |
+
+Every scenario returns a gate decision — `PROCEED`, `PROCEED_WITH_HUMAN_CHECK`, or
+`BLOCK_AUTONOMOUS_ACTION` — plus a first-class uncertainty budget (3% noise floor
+never lowered; calibration κ only widens uncertainty, capped at 40; single-sided
+coverage). **Refuted scenarios stay published:** 5 of 62 are `REFUTED` and blocked,
+because knowing where *not* to trust a surrogate is the product.
+
+```bash
+pip install mcp
+python mcp/vv_gate_server.py              # stdio MCP server
+python mcp/vv_gate_server.py --selftest   # smoke test against the live API
+```
+
+> **Honest boundary:** the public edition answers the *static* question ("is this
+> scenario trustworthy?"). Verifying a model's *own arbitrary predictions* against
+> the noise-free ground truth needs the oracle inside the engine, and is *not*
+> shipped here — the tool returns an explicit "not available" instead of a
+> confident guess.
 
 ## Install
 
