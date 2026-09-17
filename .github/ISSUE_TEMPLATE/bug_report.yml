@@ -1,0 +1,54 @@
+name: Bug report
+description: Something is broken or returns a wrong answer
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: run `python skills/vv-gate/scripts/vv_gate.py selftest`.
+        It tells you whether the deployed service is reachable at all, which
+        separates "the service is down" from "this specific thing is wrong".
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - vv-gate client (skills/vv-gate/scripts/vv_gate.py)
+        - hosted endpoint (/v3/*)
+        - SDK (src/swarmlabs_engine)
+        - MCP server (mcp/server.py)
+        - docs / semantics
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction command and output
+      description: |
+        Paste the exact command and its output. For a hosted-endpoint issue,
+        include the `request_id` from the response body — it is the only handle
+        that ties a response to a server-side event.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "python 3.11.9 on macOS 14.5; vv_gate.py at commit abc1234"
+    validations:
+      required: false
+  - type: checkboxes
+    id: gate
+    attributes:
+      label: If this is about a gate decision
+      options:
+        - label: This is an input that makes a gate MORE PERMISSIVE than it should be (i.e. PROCEED where BLOCK is correct)
+          required: false
