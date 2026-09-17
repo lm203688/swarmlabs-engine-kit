@@ -80,7 +80,7 @@
         "oracle_digest": "string",
         "policy_source": "string"
       },
-      "exit_codes": { "0": "PROCEED", "2": "BLOCK_AUTONOMOUS_ACTION", "3": "PROCEED_WITH_HUMAN_CHECK", "1": "call/parameter error" },
+      "exit_codes": { "0": "PROCEED", "3": "PROCEED_WITH_HUMAN_CHECK", "2": "BLOCK_AUTONOMOUS_ACTION", "4": "unreachable — edge block / network failure; NO VERDICT was produced", "1": "local call/parameter error" },
       "depends_on": [
         "https://swarmlabs.tools/v3/verify (POST)",
         "https://swarmlabs.tools/v3/gate",
