@@ -11,7 +11,7 @@ abstract: >-
 type: software
 authors:
   - name: "SwarmLabs"
-version: "0.2.0"
+version: "0.2.1"
 date-released: "2026-09-17"
 license: MIT
 repository-code: "https://github.com/lm203688/swarmlabs-engine-kit"
