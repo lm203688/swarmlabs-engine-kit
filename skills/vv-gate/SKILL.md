@@ -161,3 +161,4 @@ State these honestly when you present results:
 | `scripts/vv_gate.py` | the client (stdlib only, single file) |
 | `references/gate-semantics.md` | thresholds, verdict→gate mapping, provenance, UA probe results |
 | `tests/run_selftest.py` | runs `selftest` and asserts exit code + required fields |
+| `tests/check_stdlib_only.py` | CI guard for the stdlib-only invariant |
