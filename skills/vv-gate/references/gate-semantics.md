@@ -216,8 +216,14 @@ local loop of the same test passed three times in a row. So:
 | `len(x)` ≠ scenario `dim` | `400 bad_request` |
 | any `x[i]` differs from published `x[i]` by > `1e-6` | `400 bad_request` + offending `index` |
 | unknown `scenario_key` | `404 unknown_scenario` + `available_count` |
+| **the held-out asset could not be read** (empty body / bad JSON / non-404 status) | **`503 asset_unavailable`** + `retryable: true` |
 | `GET` | `405 method_not_allowed` |
 | `gate_policy` absent | `503 policy_unavailable` |
+
+Note the row above `GET`: a read failure is **not** an unknown scenario. The
+service used to collapse both into `404 unknown_scenario`, which meant it would
+confidently assert that a scenario it publishes does not exist. Fail-closed on
+this axis means `503 + retryable`, never a fabricated `404`. See §6.2b.
 
 The `1e-6` alignment check exists because scoring a mis-aligned submission
 would produce a confidently wrong R² — the exact failure this service is built
@@ -226,11 +232,11 @@ to refuse. Use `template` to obtain a correct `x` skeleton and only fill
 
 ### 6.2b Transient failures retry; verdicts do not
 
-`vv_gate.py` retries `429 / 500 / 502 / 503 / 504`, network errors, **and
-`403 + error code 1010`**, with backoff (max 4 attempts, honouring
-`Retry-After`). It returns `400 / 404 / 405` **immediately**, and a `403` that
-does *not* carry `1010` is returned immediately too — that one is a real edge
-policy rejection, not a coin flip.
+`vv_gate.py` retries `429 / 500 / 502 / 503 / 504`, network errors,
+**`403 + error code 1010`**, and **a 2xx whose body is empty or not JSON**, with
+backoff (max 4 attempts, honouring `Retry-After`). It returns `400 / 404 / 405`
+**immediately**, and a `403` that does *not* carry `1010` is returned immediately
+too — that one is a real edge policy rejection, not a coin flip.
 
 That distinction is deliberate and is the difference between a useful CI gate
 and a nuisance: a 400 is a verdict about your input (retrying it is pointless),
@@ -240,7 +246,7 @@ testing. `selftest` prints the transport counters so you can see when this is
 happening:
 
 ```
-[5] transport: 0 transient retry(ies), 0 edge block(s), last_status=None
+[5] transport: 0 transient retry(ies), 0 edge block(s), 0 empty-body response(s), last_status=None
 ```
 
 If you re-implement the client, copy this behaviour. Note that `503` is
@@ -248,15 +254,49 @@ ambiguous: it is also the correct response for `policy_unavailable`, and in that
 case retrying will not help. Four attempts costs a few seconds, so the retry is
 kept for both.
 
-The retry path is covered by a **deterministic** regression test, not just a
-pure-function assertion: `tests/run_selftest.py` group `[J]` stands up a local
-HTTP server that always answers `403 error code: 1010` and asserts that the
-client retried exactly `MAX_ATTEMPTS` times and exited `4`; it then switches the
-fake to a plain `403` and asserts a **single** attempt. The second half is the
-control case — without it, "we retry 1010" and "we retry every 403" would look
-identical in the logs.
+When every attempt fails, the client raises `EdgeBlocked` or `BadResponse` and
+exits **`4`** — *unreachable*, i.e. **no verdict exists**. It is not a weaker
+`PROCEED` and it is not a `BLOCK`.
+
+#### The empty-body case is real, not hypothetical
+
+Measured on CI: `GET /reports/benchmark/bio_logistic.json` intermittently
+answered `200` with a zero-length body. The runner log was
 
 ```
+File ".../vv_gate.py", line 133, in _get
+    return json.loads(r.read().decode("utf-8"))
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+```
+
+— a bare traceback pointing at our own client, which reads like a bug in the
+client and is not. In the MCP channel the same anomaly came back as a **bogus
+`404 unknown_scenario`**, because the server collapsed "asset absent" and "asset
+unreadable" into one `null`.
+
+So the rule your client must implement is not just "retry 5xx": **a 2xx is not
+automatically an answer.** Parse it, and if there is nothing to parse, treat it
+as a transport anomaly.
+
+#### How CI uses exit `4`
+
+The two live jobs retry **once on exit `4` and only on exit `4`**. A
+behavioural regression (exit `1`, a real 4xx the API should not return) fails
+immediately. There is deliberately no `continue-on-error` and no `|| true`:
+those would hide genuine regressions, and mapping `4` to success would mean the
+pipeline proceeds when nobody adjudicated anything. Retrying on a code that
+means "no answer was produced" is the honest middle.
+
+The retry paths are covered by **deterministic** regression tests, not just
+pure-function assertions — every fake upstream is a real socket on `127.0.0.1`,
+so the retry loop, the exception type and the exit code are all exercised:
+
+```
+[B3] a 200 with an EMPTY body is retried, then reported as unreachable
+  ok   empty-body 200 -> exit 4 (expected 4)
+  ok   retried 4x (expected 4) — an anomaly, so retry it
+  ok   stderr names the anomaly instead of a bare JSONDecodeError traceback
+  ok   no raw JSONDecodeError escapes to the caller
 [J] the exact CI failure, reproduced deterministically (local fake edge)
   ok   403/1010 -> exit 4 (expected 4)
   ok   retried 4x (expected 4) — the block is probabilistic
@@ -265,6 +305,9 @@ identical in the logs.
   ok   a plain 403 is NOT retried (1 hit(s)) — control case
   ok   a plain 403 is not misreported as BLOCK (exit 1)
 ```
+
+The `[J]` control case matters: without it, "we retry 1010" and "we retry every
+403" would look identical in the logs.
 
 ### 6.3 Endpoint map
 
