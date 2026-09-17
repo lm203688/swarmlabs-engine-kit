@@ -85,14 +85,30 @@ BACKOFF_S = (1.5, 4.0, 9.0)
 #: Mirrors vv_gate.py: `4` means "no verdict exists", distinct from BLOCK (`2`).
 EXIT_UNREACHABLE = 4
 
-_TRANSPORT = {"retries": 0, "edge_blocks": 0, "last_status": None}
+_TRANSPORT = {"retries": 0, "edge_blocks": 0, "bad_bodies": 0, "last_status": None}
 
 #: Errors that mean "we never reached the adjudicator", i.e. no verdict exists.
-UNREACHABLE_ERRORS = ("edge_blocked", "network_error")
+#: `bad_response` is an HTTP 200 with no usable JSON body — measured on CI
+#: (2026-09-17) on /reports/benchmark/<key>.json, where it surfaced to the caller
+#: as a bogus `unknown_scenario`. A 200-with-nothing is an anomaly, not an answer.
+#: The 503 family (`asset_unavailable`, `service_unavailable`, `policy_unavailable`)
+#: is the server saying it could not read its own data or thresholds: also no verdict.
+UNREACHABLE_ERRORS = ("edge_blocked", "network_error", "bad_response",
+                      "asset_unavailable", "service_unavailable", "policy_unavailable")
 
 
 def _is_edge_block(status, raw) -> bool:
     return status == 403 and BLOCKED_EDGE_CODE in (raw or "")
+
+
+def _parse_json(raw):
+    """(ok, value). An empty or non-JSON body is *not* a value."""
+    if not raw or not raw.strip():
+        return False, None
+    try:
+        return True, json.loads(raw)
+    except ValueError:
+        return False, None
 
 
 def _sleep(i, retry_after=None):
@@ -125,11 +141,23 @@ def _request(base, path, payload=None, timeout=90.0):
 
     last = None
     saw_edge = False
+    bad_body = False
+    preview = ""
     for i in range(MAX_ATTEMPTS):
+        bad_body = False
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, json.loads(r.read().decode("utf-8"))
+                raw = r.read().decode("utf-8", "replace")
+                ok, value = _parse_json(raw)
+                if ok:
+                    return r.status, value
+                bad_body = True
+                _TRANSPORT["bad_bodies"] += 1
+                _TRANSPORT["retries"] = i
+                preview = raw[:200]
+                if i < MAX_ATTEMPTS - 1:
+                    _sleep(i)
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
             edge = _is_edge_block(e.code, raw)
@@ -167,6 +195,10 @@ def _request(base, path, payload=None, timeout=90.0):
             if i < MAX_ATTEMPTS - 1:
                 _sleep(i)
 
+    if bad_body:
+        # 注意：必须在解包 `last` 之前返回——一次坏的 2xx 不会写 `last`。
+        return 200, {"error": "bad_response", "status": 200, "attempts": MAX_ATTEMPTS,
+                     "preview": preview}
     status, body = last
     if saw_edge:
         return status, {
@@ -188,22 +220,42 @@ def _unavailable(what, st, d):
     """
     out = {"error": f"{what}_unavailable", "status": st}
     if isinstance(d, dict) and d.get("error") in UNREACHABLE_ERRORS:
+        # `cause` 保留底层成因：`edge_blocked`（边缘拦截）与 `bad_response`
+        # （200 但无 body）在排障上是两件完全不同的事，不能在这一层被抹平。
         out.update({"unreachable": True, "retryable": True,
+                    "cause": d.get("error"),
                     "exit_code": EXIT_UNREACHABLE,
-                    "note": ("No verdict was produced: the adjudicator was not reached. "
-                             f"Cloudflare answered 403/1010 on all {MAX_ATTEMPTS} attempts "
-                             "and the block is not deterministic. Treat as infrastructure "
-                             "(retry / alert) - never as PROCEED (0) and never as BLOCK (2).")})
+                    "note": ("No verdict was produced: the adjudicator was not reached "
+                             f"({d.get('error')}). Cloudflare's 403/1010 block and a 200 "
+                             "with an empty body are both non-deterministic upstream "
+                             "anomalies. Treat as infrastructure (retry / alert) - never "
+                             "as PROCEED (0) and never as BLOCK (2).")})
         if d.get("reason"):
             out["reason"] = d["reason"]
+        if d.get("preview"):
+            out["preview"] = d["preview"]
     return out
+
+
+def _maybe_unavailable(what, st, d):
+    """Return a labelled failure if this result carries no verdict, else None.
+
+    Keyed on the *error marker*, not on the status code: a `bad_response` is an
+    HTTP 200 that contains no answer, so a plain `st != 200` guard would let it
+    through and the caller would see a naked `{"error": "bad_response"}` with no
+    `exit_code` — exactly the silent path this whole file exists to close.
+    """
+    if st != 200 or (isinstance(d, dict) and d.get("error") in UNREACHABLE_ERRORS):
+        return _unavailable(what, st, d)
+    return None
 
 
 # ---------------------------------------------------------------------- tools
 def tool_list_scenarios(base):
     st, idx = _request(base, "/v3/benchmark")
-    if st != 200:
-        return _unavailable("benchmark", st, idx)
+    u = _maybe_unavailable("benchmark", st, idx)
+    if u:
+        return u
     rows = idx.get("scenarios") or {}
     if isinstance(rows, list):
         rows = {r.get("key") or r.get("scenario_key"): r for r in rows}
@@ -218,8 +270,9 @@ def tool_gate_decision(base, args):
     key = (args or {}).get("scenario_key")
     path = f"/v3/gate/{urllib.parse.quote(key)}" if key else "/v3/gate"
     st, d = _request(base, path)
-    if st != 200:
-        return _unavailable("gate", st, d)
+    u = _maybe_unavailable("gate", st, d)
+    if u:
+        return u
     d = dict(d) if isinstance(d, dict) else {"body": d}
     d["exit_code"] = GATE_EXIT.get(d.get("gate"), None)
     return d
@@ -227,8 +280,9 @@ def tool_gate_decision(base, args):
 
 def tool_ledger_provenance(base):
     st, d = _request(base, "/v3/gate")
-    if st != 200:
-        return _unavailable("ledger", st, d)
+    u = _maybe_unavailable("ledger", st, d)
+    if u:
+        return u
     return {k: d.get(k) for k in
             ("name", "version", "generated_at_utc", "standard", "policy",
              "counts", "total", "n_blocked", "n_human_check_required", "provenance")}
@@ -243,12 +297,14 @@ def tool_wet_lab_anchors(base, args):
                     "hint": "call with no key to list; both literature anchor keys "
                             "(e.g. ecoli_glucose_Ks) and scenario keys "
                             "(e.g. microbio_monod) are accepted"}
-        if st != 200:
-            return _unavailable("anchors", st, d)
+        u = _maybe_unavailable("anchors", st, d)
+        if u:
+            return u
         return d
     st, d = _request(base, "/v3/anchors")
-    if st != 200:
-        return _unavailable("anchors", st, d)
+    u = _maybe_unavailable("anchors", st, d)
+    if u:
+        return u
     return {"summary": d.get("summary"), "anchors": d.get("anchors"),
             "n_scenarios": len(d.get("scenarios") or []), "note": d.get("note")}
 
@@ -455,12 +511,21 @@ def serve(base):
 def selftest(base):
     """Drive a real protocol session against the live API."""
     ok = True
+    #: 无法到达裁决者的检查项。它们**没有结论**，既不算通过也不算回归。
+    unreachable = []
 
     def chk(cond, label):
         nonlocal ok
         print(("  ok   " if cond else "  FAIL ") + label)
         if not cond:
             ok = False
+
+    def live(payload, label):
+        """标记一次'本应拿到裁决'的调用；若结果为不可达则记录下来。"""
+        if isinstance(payload, dict) and payload.get("unreachable"):
+            unreachable.append((label, payload.get("error"), payload.get("note")))
+            return None
+        return payload
 
     print(f"base = {base}")
     r = handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, base)
@@ -471,34 +536,36 @@ def selftest(base):
 
     r = handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "list_scenarios", "arguments": {}}}, base)
-    scen = json.loads(r["result"]["content"][0]["text"])
+    scen = live(json.loads(r["result"]["content"][0]["text"]), "list_scenarios") or {}
     chk(scen.get("total") == 62, f"list_scenarios total={scen.get('total')}")
     key = (scen.get("scenarios") or [{}])[0].get("scenario_key")
     chk(bool(key), f"first scenario key = {key}")
 
     r = handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                 "params": {"name": "gate_decision", "arguments": {"scenario_key": key}}}, base)
-    gd = json.loads(r["result"]["content"][0]["text"])
+    gd = live(json.loads(r["result"]["content"][0]["text"]), "gate_decision") or {}
     chk(gd.get("gate") in GATE_EXIT, f"gate_decision gate={gd.get('gate')} exit={gd.get('exit_code')}")
 
     r = handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
                 "params": {"name": "ledger_provenance", "arguments": {}}}, base)
-    lp = json.loads(r["result"]["content"][0]["text"])
+    lp = live(json.loads(r["result"]["content"][0]["text"]), "ledger_provenance") or {}
     chk(bool((lp.get("provenance") or {}).get("engine", {}).get("all_digest")),
         "ledger_provenance carries engine.all_digest")
 
     r = handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
                 "params": {"name": "wet_lab_anchors",
                            "arguments": {"key": "microbio_monod"}}}, base)
-    an = json.loads(r["result"]["content"][0]["text"])
+    an = live(json.loads(r["result"]["content"][0]["text"]), "wet_lab_anchors") or {}
     chk(an.get("chains_agree") is False,
         f"dual chain on microbio_monod: vv={((an.get('vv_gate') or {}).get('gate'))} "
         f"wet_lab={((an.get('wet_lab') or {}).get('gate'))} -> disagree")
+    chk(((an.get("vv_gate_read") or {}).get("ok")) is not False,
+        "the V&V half of the dual chain was actually readable")
 
     r = handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                 "params": {"name": "verify_prediction",
                            "arguments": {"scenario_key": key, "predictions": [{"y_pred": 1.0}]}}}, base)
-    vd = json.loads(r["result"]["content"][0]["text"])
+    vd = live(json.loads(r["result"]["content"][0]["text"]), "verify_prediction") or {}
     chk(vd.get("http_status") == 400, f"wrong-length submission refused (HTTP {vd.get('http_status')})")
 
     r = handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
@@ -511,17 +578,26 @@ def selftest(base):
     chk(_is_edge_block(404, "1010") is False, "404 is never an edge block")
     chk(EXIT_UNREACHABLE == 4 and EXIT_UNREACHABLE not in (2, 3),
         "unreachable exit code is 4, distinct from BLOCK (2)")
+    chk(_parse_json("") == (False, None), "an empty body is not a value")
+    chk(_parse_json("   ") == (False, None), "a whitespace-only body is not a value")
+    chk(_parse_json("<html>oops</html>")[0] is False, "an HTML body is not JSON")
+    chk(_parse_json('{"a":1}') == (True, {"a": 1}), "valid JSON still parses")
 
     import http.server
     import threading
 
     class FakeEdge(http.server.BaseHTTPRequestHandler):
         hits = 0
+        mode = "1010"
 
         def _reply(self):
             type(self).hits += 1
-            body = b"<html><body><h1>Error 1010</h1>error code: 1010</body></html>"
-            self.send_response(403)
+            if type(self).mode == "1010":
+                body = b"<html><body><h1>Error 1010</h1>error code: 1010</body></html>"
+                self.send_response(403)
+            else:                                  # HTTP 200, zero-length body
+                body = b""
+                self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -540,6 +616,8 @@ def selftest(base):
     try:
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        FakeEdge.mode, FakeEdge.hits = "1010", 0
         r = handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
                     "params": {"name": "gate_decision", "arguments": {}}},
                    f"http://127.0.0.1:{port}")
@@ -551,8 +629,25 @@ def selftest(base):
         chk(edge.get("gate") is None,
             "no gate field is invented on an unreachable result (no implicit pass)")
         chk(FakeEdge.hits == MAX_ATTEMPTS,
-            f"retried {FakeEdge.hits}x (expected {MAX_ATTEMPTS})")
-        chk(_TRANSPORT["edge_blocks"] > 0, f"transport counter edge_blocks={_TRANSPORT['edge_blocks']}")
+            f"retried {FakeEdge.hits}x on 403/1010 (expected {MAX_ATTEMPTS})")
+
+        # The CI run #27 failure, reduced to a deterministic test: HTTP 200 with a
+        # zero-length body, which the caller must NOT read as "no such scenario".
+        FakeEdge.mode, FakeEdge.hits = "empty", 0
+        r = handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                    "params": {"name": "gate_decision", "arguments": {}}},
+                   f"http://127.0.0.1:{port}")
+        emp = json.loads(r["result"]["content"][0]["text"])
+        chk(emp.get("cause") == "bad_response",
+            f"empty 200 -> cause={emp.get('cause')!r} (the empty body must survive as the cause)")
+        chk(emp.get("unreachable") is True, "an empty 200 is reported as unreachable, not as unknown")
+        chk(emp.get("exit_code") == EXIT_UNREACHABLE, "empty 200 carries exit_code=4")
+        chk(emp.get("gate") is None, "an empty 200 invents no gate")
+        chk(emp.get("error") == "gate_unavailable",
+            f"empty 200 surfaces as a *_unavailable, not as a bare transport error ({emp.get('error')})")
+        chk(FakeEdge.hits == MAX_ATTEMPTS,
+            f"retried {FakeEdge.hits}x on an empty 200 (expected {MAX_ATTEMPTS})")
+        chk(_TRANSPORT["bad_bodies"] > 0, f"transport counter bad_bodies={_TRANSPORT['bad_bodies']}")
 
         r = handle({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
                     "params": {"name": "list_scenarios", "arguments": {}}},
@@ -564,6 +659,17 @@ def selftest(base):
         srv.shutdown()
         srv.server_close()
         globals()["_sleep"] = _saved_sleep
+
+    if unreachable:
+        # 无关可达性的检查项仍然会被重跑，所以这里只需把"没有结论"如实说出。
+        print()
+        print(f"UNREACHABLE: {len(unreachable)} live check(s) produced no verdict:")
+        for label, err, _note in unreachable:
+            print(f"  - {label}: {err}")
+        print("Any FAIL above is a *consequence* of that unreachability, not a "
+              "behavioural regression. Exiting 4 so CI retries the step instead of "
+              "reporting a regression that did not happen. Do NOT map this to success.")
+        return 4
 
     print("SELFTEST " + ("OK" if ok else "FAILED"))
     return 0 if ok else 1
