@@ -131,6 +131,19 @@ deployment instead of tracking `main`.
    while both offline jobs stayed green. So a single 1010 must never be read as
    "the service is broken". `vv_gate.py` retries it like a transient failure and
    only then reports exit `4`.
+
+   > **Correction (0.2.2).** This gotcha is real but was **over-applied**: the red
+   > live jobs were partly 1010/empty-body, but the dominant cause was the host
+   > project serving **a partially landed deployment** — 6 of 10 consecutive
+   > deploys, each reporting `Uploaded 374 files`, were incomplete, and Pages
+   > answers a path that did not land with the SPA's `index.html` at status **200**
+   > `text/html` (so no status-code check could see it). A 7-day-TTL edge cache
+   > holding a good copy then made 100% breakage look like ~15% flakiness. After
+   > gating the deployment on byte-for-byte content, the live failure rate went
+   > from **14.7% to 0.7%**. Keep the retry (it is correct), but do not let
+   > "non-deterministic upstream" become the standing explanation for a red job —
+   > it is a hypothesis, and it is sometimes just a wrong answer being served.
+
 2. **`x` must be byte-identical to the published held-out `x`.** Any point
    whose `x` differs by more than `1e-6` is rejected with `400` and the offending
    `index`. Do not resample, reorder, or normalise. Use `template` as the base.
