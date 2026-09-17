@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swarmlabs-engine-kit"
-version = "0.1.0"
-description = "Open-source client SDK, MCP server, and Skill catalog for the SwarmLabs physics-informed scientific experiment automation engine."
+version = "0.2.0"
+description = "Open-source client SDK, MCP server, and agent Skills for the SwarmLabs physics-informed scientific experiment automation engine — including vv-gate, an independent fail-closed verification gate."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
@@ -16,12 +16,21 @@ keywords = [
     "multi-agent",
     "experiment-automation",
     "mcp",
+    "model-context-protocol",
     "agent-infrastructure",
+    "verification-and-validation",
+    "uncertainty-quantification",
+    "reproducibility",
+    "research-integrity",
+    "ai-safety",
 ]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Science/Research",
+    "Development Status :: 3 - Alpha",
 ]
 
 [project.urls]
