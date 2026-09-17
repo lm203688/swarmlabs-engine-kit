@@ -25,6 +25,18 @@ and tags are immutable.
   - `tests/check_stdlib_only.py` — CI guard for the stdlib-only invariant.
     Mechanical on purpose: a third-party import would not show up in the live
     smoke test on a machine that happens to have the dependency.
+- **`vv_gate_server.py`** — a **zero-dependency** MCP stdio server exposing the
+  gate as six tools (`list_scenarios`, `gate_decision`, `ledger_provenance`,
+  `wet_lab_anchors`, `get_held_out_template`, `verify_prediction`). Hand-rolled
+  on stdlib JSON-RPC instead of `pip install mcp` + FastMCP, so it can be
+  dropped into an MCP host config and run on a machine with nothing but Python.
+  `--selftest` drives a real protocol session against the live service.
+
+  This replaces the previous `mcp/vv_gate_server.py`, which required `pip
+  install mcp` **and** documented a boundary ("CANNOT run verify_prediction on
+  your own predictions — that requires the noise-free oracle, which is not
+  shipped here") that stopped being true when the public `POST /v3/verify`
+  endpoint went live. The gate can now actually gate.
 - `.github/workflows/ci.yml` — syntax + JSON parse, the stdlib-only invariant,
   and the live smoke test against the deployed service. Unguarded steps: a
   non-zero exit fails the job. The live job going red when the service is down
