@@ -3,7 +3,9 @@
 > Open-source client SDK, MCP server, and Skill catalog for the **SwarmLabs
 > physics-informed multi-agent scientific experiment automation engine**.
 
+[![CI](https://github.com/lm203688/swarmlabs-engine-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/lm203688/swarmlabs-engine-kit/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](pyproject.toml)
 
 SwarmLabs is an open infrastructure that turns **multidisciplinary scientific
 experiments** (chemistry, energy, materials, environment, biology, pharma,
