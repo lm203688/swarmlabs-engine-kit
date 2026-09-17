@@ -22,7 +22,7 @@ for anything time-sensitive.
 
 ```bash
 # 1. syntax, all Python in the repo
-python -m compileall -q src mcp skills examples
+python -m compileall -q src skills examples mcp_server.py
 
 # 2. stdlib-only invariant inside skills/vv-gate/ (the CI-enforced hard line)
 python skills/vv-gate/tests/check_stdlib_only.py
