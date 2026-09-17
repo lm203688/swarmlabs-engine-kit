@@ -22,9 +22,10 @@ for anything time-sensitive.
 
 ```bash
 # 1. syntax, all Python in the repo
-python -m compileall -q src skills examples mcp_server.py
+python -m compileall -q src skills examples mcp_server.py vv_gate_server.py
 
-# 2. stdlib-only invariant inside skills/vv-gate/ (the CI-enforced hard line)
+# 2. stdlib-only invariant (the CI-enforced hard line). Covers skills/vv-gate/
+#    and the top-level vv_gate_server.py.
 python skills/vv-gate/tests/check_stdlib_only.py
 
 # 3. the live smoke test (network — it talks to the deployed service)
@@ -32,12 +33,15 @@ python skills/vv-gate/tests/run_selftest.py
 
 # 4. the shipped client's own smoke test
 python skills/vv-gate/scripts/vv_gate.py selftest
+
+# 5. the stdio MCP server's protocol smoke test
+python vv_gate_server.py --selftest
 ```
 
-`check_stdlib_only.py` fails on any non-stdlib import under `skills/vv-gate/`.
-It is deliberately mechanical: a third-party import there would not even show
-up in the live smoke test on a machine that happens to have the dependency, so
-review is not a sufficient check.
+`check_stdlib_only.py` fails on any non-stdlib import under `skills/vv-gate/`
+or in `vv_gate_server.py`. It is deliberately mechanical: a third-party import
+there would not even show up in the live smoke test on a machine that happens to
+have the dependency, so review is not a sufficient check.
 
 `tests/run_selftest.py` asserts the things that tend to silently rot:
 the verdict→gate mapping is fail-closed, `ERROR` has no permissive exit code,
