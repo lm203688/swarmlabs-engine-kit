@@ -205,6 +205,28 @@ would produce a confidently wrong R² — the exact failure this service is buil
 to refuse. Use `template` to obtain a correct `x` skeleton and only fill
 `y_pred` / `y_std`.
 
+### 6.2b Transient failures retry; verdicts do not
+
+`vv_gate.py` retries `429 / 500 / 502 / 503 / 504` and network errors with
+backoff (max 4 attempts, honouring `Retry-After`). It returns `400 / 404 / 405`
+**immediately**.
+
+That distinction is deliberate and is the difference between a useful CI gate
+and a nuisance: a 400 is a verdict about your input (retrying it is pointless),
+while a 429 is the service telling you to come back. A gate that goes red on a
+transient rate limit teaches people to ignore red — which is worse than not
+testing. `selftest` prints the retry count so you can see when this is
+happening:
+
+```
+[5] transport: 0 transient retry(ies), last_status=None
+```
+
+If you re-implement the client, copy this behaviour. Note that `503` is
+ambiguous: it is also the correct response for `policy_unavailable`, and in that
+case retrying will not help. Four attempts costs a few seconds, so the retry is
+kept for both.
+
 ### 6.3 Endpoint map
 
 | Endpoint | Serves |
