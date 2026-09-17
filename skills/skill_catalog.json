@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "project": "SwarmLabs",
-  "description": "Core Skills composing the SwarmLabs multi-agent scientific experiment automation loop (Planner -> Executor -> Verifier).",
+  "description": "Core Skills composing the SwarmLabs multi-agent scientific experiment automation loop (Planner -> Executor -> Verifier), plus the standalone V&V gate Skill that can refuse that loop's claims.",
   "skills": [
     {
       "id": "PhysicsPredictSkill",
@@ -54,6 +54,48 @@
       "depends_on": ["template engine"],
       "safety": "Does not emit secrets or internal implementation details.",
       "used_by": ["VerifierAgent"]
+    },
+    {
+      "id": "vv-gate",
+      "kind": "agentskills",
+      "spec": "agentskills.io",
+      "path": "skills/vv-gate/SKILL.md",
+      "entrypoint": "skills/vv-gate/scripts/vv_gate.py",
+      "purpose": "Independent third-party adjudication of a numeric claim against held-out ground truth and literature anchors. Answers 'your prediction is wrong' — not merely 'your run is reproducible' — and returns a blocking exit code.",
+      "input": {
+        "scenarios": "no args -> list published scenarios",
+        "check": "key? -> static gate decision from the published ledger",
+        "anchors": "key? -> wet-lab anchor chain (literature ranges)",
+        "template": "key -o out.json -> held-out points as an editable prediction file",
+        "verify": "key --pred p.json -> POST /v3/verify, dynamic adjudication of YOUR prediction"
+      },
+      "output": {
+        "verdict": "PASS | MARGINAL | REFUTED | ERROR",
+        "gate": "PROCEED | PROCEED_WITH_HUMAN_CHECK | BLOCK_AUTONOMOUS_ACTION",
+        "r2": "number",
+        "coverage": "number? (only when y_std supplied; null means not evaluated, not 1)",
+        "calibration_kappa_suggestion": "number?",
+        "agent_overconfident": "boolean?",
+        "engine_digest": "string (all_digest / core_digest / git_commit)",
+        "oracle_digest": "string",
+        "policy_source": "string"
+      },
+      "exit_codes": { "0": "PROCEED", "2": "BLOCK_AUTONOMOUS_ACTION", "3": "PROCEED_WITH_HUMAN_CHECK", "1": "call/parameter error" },
+      "depends_on": [
+        "https://swarmlabs.tools/v3/verify (POST)",
+        "https://swarmlabs.tools/v3/gate",
+        "https://swarmlabs.tools/v3/anchors",
+        "https://swarmlabs.tools/v3/benchmark"
+      ],
+      "dependencies": "none (Python 3.8+ stdlib only; no numpy, no API key, no engine clone)",
+      "safety": "Read-only over published endpoints. Sends your predictions outbound only. Fail-closed: ERROR maps to BLOCK, absent policy returns 503 rather than a silent default.",
+      "consumer_notes": [
+        "Cloudflare returns 403 error code 1010 for an empty User-Agent or the stdlib default Python-urllib/x.y; an explicit UA is required.",
+        "x must match the published held-out x within 1e-6 or the submission is rejected with 400 + the offending index.",
+        "Prediction count must equal the published count (400 bad_request with n_expected/n_got otherwise).",
+        "Thresholds live in exactly one place: engine/verification_gate.py::thresholds(), exported at build time into gate_policy."
+      ],
+      "used_by": ["any agent harness", "CI pipeline", "external evaluator"]
     }
   ]
 }
