@@ -4,6 +4,50 @@ All notable changes to this kit. Versions follow the `pyproject.toml` version
 field; there are no maintained release branches — `main` is the supported line,
 and tags are immutable.
 
+## [0.2.2] — 2026-09-17
+
+### Fixed
+
+- **The live self-test treated "the adjudicator is unreachable" as "the gate is
+  broken."** `vv_gate_server.py --selftest` drove a real session and then, for
+  every live call, did `live(payload, label) or {}` — so an unreachable result
+  collapsed into an empty dict and the following assertion failed. That is the
+  same error class this kit exists to prevent, pointed the other way round: a
+  red that the evidence does not support. `live()` now returns
+  `(data, reachable)`; when `reachable` is False the assertion is **skipped**
+  and the call is counted towards exit `4`. The CLI runner
+  (`skills/vv-gate/tests/run_selftest.py`) already got this right — a `503` is in
+  `TRANSIENT_STATUS`, so it propagates and exits `4` — which is why only the MCP
+  channel was affected.
+
+### Corrected
+
+- **0.2.1 documented the wrong upstream cause.** The live jobs were going red
+  partly because of `403`/`1010` and empty bodies — those are real — but the
+  dominant case was **a partially landed deployment**, and the note that "the
+  block is probabilistic" was a misreading. What actually happened, measured:
+
+  | observation | value |
+  |---|---|
+  | `wrangler pages deploy` reported | `Uploaded 374 files` — every time |
+  | deployments that were actually complete | **4 of 10** |
+  | one incomplete deployment, files served correctly | **62 of 379** |
+  | `GET /v3/verify` failure rate, before | 8.3% → 14.7% |
+  | `GET /v3/verify` failure rate, after | **0.7%** |
+
+  Cloudflare Pages answers a path that did not land with the SPA's `index.html`
+  at status **200** `text/html` — so "status 200 means deployed" is false, and a
+  client that reads its own assets sees a *present-looking* response that is not
+  the asset. On `swarmlabs.tools` an edge cache entry with a 7-day TTL happened to
+  hold a good copy, which is why the failure looked like ~15% instead of 100%:
+  the cache was not the bug, it was the cover.
+
+  Nothing in `vv-gate` needed to change for the deployment side — the fix is a
+  byte-for-byte post-deploy gate in the host project. What this kit gained is the
+  discipline being applied consistently: read the **content**, not the status
+  code, and never let one observation decide that something is absent.
+
+
 ## [0.2.1] — 2026-09-17
 
 ### Fixed
