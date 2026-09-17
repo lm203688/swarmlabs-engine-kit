@@ -3,10 +3,21 @@ name: CI
 # Runs the checks that tend to silently rot. Deliberately unguarded steps: a
 # non-zero exit fails the job. See CONTRIBUTING.md.
 #
-# `vv-gate-selftest` is a NETWORK test — it talks to the deployed service,
-# because the point of the gate is that the adjudicator is not local. If the
-# service is down, this job goes red. That is intended: a gate you cannot reach
-# is a gate you do not have.
+# The two live jobs talk to the deployed service, because the point of the gate
+# is that the adjudicator is not local. Their exit codes are load-bearing:
+#
+#   0  pass
+#   1  a behavioural regression (a real 4xx the API should not return, a broken
+#      assertion, a contract change) -> fail the job immediately, do NOT retry
+#   4  UNREACHABLE: no verdict was produced (Cloudflare 403/1010, a 200 with an
+#      empty body, a network failure). -> retry once, then fail
+#
+# Why retry 4 but not 1: the upstream anomalies are measured to be
+# non-deterministic (run #29 and #30 carried byte-identical code and differed
+# only in a docs file, yet one went green and one red). A retry driven by the
+# exit code is honest — it retries only the "no answer" case. Setting
+# `continue-on-error: true` would instead hide genuine regressions, and mapping
+# 4 to success would mean the pipeline proceeds when nobody adjudicated anything.
 
 on:
   push:
@@ -50,7 +61,20 @@ jobs:
         # Drives a real protocol session: initialize, tools/list, and one live
         # tools/call against the deployed service. It has no third-party deps,
         # so there is nothing to install first - which is the point.
-        run: python vv_gate_server.py --selftest
+        run: |
+          set +e
+          python vv_gate_server.py --selftest
+          rc=$?
+          if [ "$rc" = "4" ]; then
+            echo "::warning::unreachable (exit 4) - no verdict was produced; retrying once"
+            sleep 5
+            python vv_gate_server.py --selftest
+            rc=$?
+          fi
+          if [ "$rc" = "4" ]; then
+            echo "::error::still unreachable after a retry - the gate cannot be consulted"
+          fi
+          exit $rc
 
       - name: JSON assets parse
         # 一行式，避免 YAML block scalar 的缩进被原样喂给 python 引发的
@@ -85,6 +109,35 @@ jobs:
         with:
           python-version: '3.8'
       - name: Live smoke test against the deployed service
-        run: python skills/vv-gate/tests/run_selftest.py
+        # Groups A, B, B2, B3, I and J are fully local (they stand up their own
+        # fake servers), so an unreachable upstream still exercises the transport
+        # contract before bailing out with 4.
+        run: |
+          set +e
+          python skills/vv-gate/tests/run_selftest.py
+          rc=$?
+          if [ "$rc" = "4" ]; then
+            echo "::warning::unreachable (exit 4) - no verdict was produced; retrying once"
+            sleep 5
+            python skills/vv-gate/tests/run_selftest.py
+            rc=$?
+          fi
+          if [ "$rc" = "4" ]; then
+            echo "::error::still unreachable after a retry - the gate cannot be consulted"
+          fi
+          exit $rc
       - name: Client selftest
-        run: python skills/vv-gate/scripts/vv_gate.py selftest
+        run: |
+          set +e
+          python skills/vv-gate/scripts/vv_gate.py selftest
+          rc=$?
+          if [ "$rc" = "4" ]; then
+            echo "::warning::unreachable (exit 4) - retrying once"
+            sleep 5
+            python skills/vv-gate/scripts/vv_gate.py selftest
+            rc=$?
+          fi
+          if [ "$rc" = "4" ]; then
+            echo "::error::still unreachable after a retry - the gate cannot be consulted"
+          fi
+          exit $rc
