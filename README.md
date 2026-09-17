@@ -103,6 +103,15 @@ persists, report **unreachable** (`exit 4`, `unreachable: true`) rather than
 guessing. Do not "fix" it by caching the last verdict or by mapping it to
 success — that turns the gate into decoration.
 
+That said, **"non-deterministic upstream" is a hypothesis, not a diagnosis.**
+See [`CHANGELOG.md`](CHANGELOG.md) `[0.2.2]`: the live failure rate turned out to
+be dominated by the host project serving *partially landed deployments*, which
+Pages hides behind a **`200 text/html`** SPA fallback. Gating the deployment on
+byte-for-byte content took the live failure rate from 14.7% to 0.7%. When a
+client that reads its own assets gets something that is not the asset, suspect
+the deployment before you suspect the network.
+
+
 
 ## Install
 
