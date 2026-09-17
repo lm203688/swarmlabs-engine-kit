@@ -44,6 +44,7 @@ to your agent's claim, and block it. See
 |---|---|
 | `src/swarmlabs_engine/` | Python client SDK (`SwarmLabsClient`) |
 | `mcp_server.py` | Reference MCP server exposing engine calls as tools |
+| `vv_gate_server.py` | **Zero-dependency MCP gate server** — grep the gate into any MCP host, no `pip install` |
 | `skills/vv-gate/` | **Independent V&V gate** — zero-dep client + SKILL.md + semantics reference |
 | `skills/skill_catalog.json` | Machine-readable catalog of the core Skills |
 | `examples/quickstart.py` | Minimal end-to-end example |
@@ -142,25 +143,56 @@ All endpoints are served under `/api/v2/`.
 
 ## MCP integration
 
-The reference MCP server turns engine calls into standard MCP tools so any
-MCP-aware agent (Claude Desktop, Cursor, custom runtimes) can use SwarmLabs as
-a trusted scientific-compute tool:
+Two MCP servers, for two different jobs.
+
+### 1. The gate — `vv_gate_server.py` (no dependencies)
+
+```bash
+python vv_gate_server.py            # stdio MCP server
+python vv_gate_server.py --selftest # live protocol smoke test
+```
+
+```json
+{ "mcpServers": { "swarmlabs-gate": {
+    "command": "python", "args": ["/abs/path/to/vv_gate_server.py"] } } }
+```
+
+Tools: `list_scenarios`, `gate_decision`, `ledger_provenance`,
+`wet_lab_anchors`, `get_held_out_template`, and **`verify_prediction`** — the
+gate itself. Your agent submits its own numbers, this server scores them against
+a held-out set whose ground truth it holds, and returns
+`PROCEED | PROCEED_WITH_HUMAN_CHECK | BLOCK_AUTONOMOUS_ACTION`. Fail-closed: a
+misaligned or wrong-length submission is refused rather than partially scored,
+and `ERROR` maps to `BLOCK`, never to `PROCEED`.
+
+> **Why hand-rolled instead of `pip install mcp` + FastMCP.** An MCP server is
+> newline-delimited JSON-RPC 2.0 over stdio — about a hundred lines of stdlib.
+> Shipping it with **no install step at all** means it can be dropped into a
+> host config and just work on a machine that has nothing but Python. Same
+> invariant as `skills/vv-gate/`, for the same reason: a gate you cannot easily
+> run is a gate you do not have.
+
+### 2. The engine — `mcp_server.py` (needs your endpoint)
+
+The reference server that turns engine calls into tools, so any MCP-aware agent
+(Claude Desktop, Cursor, custom runtimes) can use SwarmLabs as a
+trusted scientific-compute tool:
 
 ```bash
 python mcp_server.py --base-url https://your-swarmlabs-engine.example.com
 ```
 
-It exposes `swarmlabs_run`, `swarmlabs_list`, and `swarmlabs_sweep` tools with
+It exposes `swarmlabs_run`, `swarmlabs_list`, and `swarmlabs_sweep` with
 explicit input schemas and the same honesty-first result contract.
 
-> **Why the file is at top level, not `mcp/server.py`.** It used to be the
+> **Why this file is at top level, not `mcp/server.py`.** It used to be the
 > latter, documented as `python -m mcp.server`. That fails confusingly: `mcp` is
 > also the name of the real Model Context Protocol SDK on PyPI, so
 > `python -m mcp.server` imports **that** package instead of this file. Naming
-> the module `mcp_server.py` removes the collision.
+> both modules `*_server.py` at top level removes the collision.
 
-Both `mcp_server.py` and `examples/quickstart.py` run from a fresh clone
-**without** `pip install`, by falling back to the in-repo `src/` layout.
+Both servers and `examples/quickstart.py` run from a fresh clone **without**
+`pip install`, by falling back to the in-repo `src/` layout.
 
 ## Skill catalog
 
