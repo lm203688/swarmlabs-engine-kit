@@ -91,7 +91,13 @@ GATE_EXIT = {GATE_PROCEED: 0, GATE_HUMAN: 3, GATE_BLOCK: 2}
 #: 与 `1`（本地用法错误）分开。见文件头「为什么是一个可执行脚本」。
 EXIT_UNREACHABLE = 4
 
-_LAST_TRANSPORT = {"retries": 0, "last_status": None, "edge_blocks": 0}
+#: 传输层异常，意味着**没有裁决**。全部映射到 EXIT_UNREACHABLE。
+#: `bad_response` = 200 但没有可用 body；503 家族 = 服务读不到自己的数据或阈值。
+#: 三者都**没有裁决**，都不该被读成「裁决说否」。
+UNREACHABLE_ERRORS = ("edge_blocked", "bad_response", "network_error",
+                      "asset_unavailable", "service_unavailable", "policy_unavailable")
+
+_LAST_TRANSPORT = {"retries": 0, "last_status": None, "edge_blocks": 0, "bad_bodies": 0}
 
 
 class EdgeBlocked(RuntimeError):
@@ -102,8 +108,30 @@ class EdgeBlocked(RuntimeError):
     """
 
 
+class BadResponse(RuntimeError):
+    """A 2xx arrived with no usable JSON body, and retrying did not fix it.
+
+    Measured on CI (2026-09-17): `GET /reports/benchmark/bio_logistic.json`
+    intermittently answered **200 with an empty body**, which made `json.loads`
+    raise `Expecting value: line 1 column 1` — a bare traceback that looks like
+    a bug in this client and is not. A 200 with no body is a transport anomaly:
+    no verdict was produced, so it belongs in the same family as `EdgeBlocked`,
+    not in the same family as "the gate said no".
+    """
+
+
 def _is_edge_block(status, raw) -> bool:
     return status == 403 and BLOCKED_EDGE_CODE in (raw or "")
+
+
+def _parse_json(raw):
+    """(ok, value). An empty or non-JSON body is *not* a value."""
+    if not raw or not raw.strip():
+        return False, None
+    try:
+        return True, json.loads(raw)
+    except ValueError:
+        return False, None
 
 
 def _sleep(i: int, retry_after=None) -> None:
@@ -122,15 +150,29 @@ def _get(base: str, path: str, timeout: float = 30.0):
 
     Returns parsed JSON. Raises HTTPError for non-transient statuses so the
     caller sees the real status (404 means "no such key", not "try again").
+    Raises BadResponse if every attempt returned a 2xx with no usable body.
     """
     last = None
+    preview = ""
+    bad_body = False
     for i in range(MAX_ATTEMPTS):
+        bad_body = False          # 只反映**最后一次**尝试，避免混用陈旧判定
         req = urllib.request.Request(base + path, method="GET",
                                      headers={"User-Agent": USER_AGENT,
                                               "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+                raw = r.read().decode("utf-8", "replace")
+                ok, value = _parse_json(raw)
+                if ok:
+                    return value
+                # 2xx with an empty / non-JSON body: retry it, it is an anomaly.
+                bad_body = True
+                _LAST_TRANSPORT["bad_bodies"] += 1
+                _LAST_TRANSPORT["retries"] = i
+                preview = raw[:200]
+                if i < MAX_ATTEMPTS - 1:
+                    _sleep(i)
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace") if e.fp else ""
             edge = _is_edge_block(e.code, raw)
@@ -152,6 +194,11 @@ def _get(base: str, path: str, timeout: float = 30.0):
             last = e
             if i < MAX_ATTEMPTS - 1:
                 _sleep(i)
+    if bad_body:
+        raise BadResponse(
+            f"GET {path} returned HTTP 200 with no usable JSON body on all "
+            f"{MAX_ATTEMPTS} attempts. Preview: {preview!r}. This is a transport "
+            f"anomaly - no verdict was produced, and it is not a client bug.")
     raise last
 
 
@@ -164,14 +211,26 @@ def _post(base: str, path: str, payload: dict, timeout: float = 90.0):
     """
     data = json.dumps(payload).encode("utf-8")
     last = None
+    preview = ""
+    bad_body = False
     for i in range(MAX_ATTEMPTS):
+        bad_body = False
         req = urllib.request.Request(
             base + path, data=data, method="POST",
             headers={"User-Agent": USER_AGENT, "Content-Type": "application/json",
                      "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, json.loads(r.read().decode("utf-8"))
+                raw = r.read().decode("utf-8", "replace")
+                ok, value = _parse_json(raw)
+                if ok:
+                    return r.status, value
+                bad_body = True
+                _LAST_TRANSPORT["bad_bodies"] += 1
+                _LAST_TRANSPORT["retries"] = i
+                preview = raw[:200]
+                if i < MAX_ATTEMPTS - 1:
+                    _sleep(i)
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
             edge = _is_edge_block(e.code, raw)
@@ -197,6 +256,11 @@ def _post(base: str, path: str, payload: dict, timeout: float = 90.0):
             last = e
             if i < MAX_ATTEMPTS - 1:
                 _sleep(i)
+    if bad_body:
+        return 200, {"error": "bad_response", "status": 200, "attempts": MAX_ATTEMPTS,
+                     "preview": preview,
+                     "note": "HTTP 200 with no usable JSON body on every attempt. No verdict "
+                             "was produced - this is a transport anomaly, not a rejection."}
     if isinstance(last, tuple):
         try:
             return last[0], json.loads(last[1])
@@ -292,6 +356,9 @@ def cmd_verify(args) -> int:
     payload["predictions"] = preds
     st, body = _post(args.base, "/v3/verify", payload)
     print(json.dumps(body, ensure_ascii=False, indent=2))
+    if body.get("error") in UNREACHABLE_ERRORS:
+        # 传输异常：没有裁决。用 4 而不是 1，让 CI 能"重试"而不是"当成回归"。
+        return EXIT_UNREACHABLE
     if st != 200:
         return 1
     return GATE_EXIT.get(body.get("gate"), 1)
@@ -325,8 +392,9 @@ def cmd_selftest(args) -> int:
         print(f"[4] anchors: {n} entries")
     r = _LAST_TRANSPORT["retries"]
     eb = _LAST_TRANSPORT["edge_blocks"]
+    bb = _LAST_TRANSPORT["bad_bodies"]
     print(f"[5] transport: {r} transient retry(ies), {eb} edge block(s), "
-          f"last_status={_LAST_TRANSPORT['last_status']}")
+          f"{bb} empty-body response(s), last_status={_LAST_TRANSPORT['last_status']}")
     print("SELFTEST " + ("OK" if ok else "FAILED"))
     return 0 if ok else 1
 
@@ -370,13 +438,14 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     try:
         return args.fn(args)
-    except EdgeBlocked as e:
+    except (EdgeBlocked, BadResponse) as e:
         # 我们**没有**拿到裁决。返回 4 而不是 2/3 —— 不能把「够不到」说成「判定为否」。
-        print(f"UNREACHABLE (edge block): {e}", file=sys.stderr)
-        print(f"hint: Cloudflare answered 403 for our explicit User-Agent "
-              f"{USER_AGENT!r} on all {MAX_ATTEMPTS} attempts. Different UAs behave "
-              f"differently and the block is not deterministic; if this is CI, treat "
-              f"it as infrastructure failure (retry/alert), not as a gate verdict.",
+        kind = "edge block" if isinstance(e, EdgeBlocked) else "bad response"
+        print(f"UNREACHABLE ({kind}): {e}", file=sys.stderr)
+        print(f"hint: the adjudicator produced no verdict after {MAX_ATTEMPTS} attempts. "
+              f"A 403 containing '1010' (Cloudflare) and a 200 with an empty body are both "
+              f"non-deterministic upstream anomalies, not client bugs. If this is CI, retry "
+              f"the step; do not map it to success and do not read it as a gate verdict.",
               file=sys.stderr)
         return EXIT_UNREACHABLE
     except urllib.error.HTTPError as e:
@@ -386,6 +455,11 @@ def main(argv=None) -> int:
             print(f"hint: Cloudflare edge block (403/1010) for {USER_AGENT!r}. "
                   "This is an edge policy rejection — no verdict was produced.",
                   file=sys.stderr)
+            return EXIT_UNREACHABLE
+        if e.code in TRANSIENT_STATUS:
+            print(f"hint: exhausted {MAX_ATTEMPTS} attempts on a transient status "
+                  f"({e.code}) — no verdict was produced. Retry rather than reading "
+                  f"this as a gate decision.", file=sys.stderr)
             return EXIT_UNREACHABLE
         return 1
     except urllib.error.URLError as e:
