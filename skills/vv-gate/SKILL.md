@@ -64,7 +64,13 @@ contract:
 | `0` | `PROCEED` | claim cleared |
 | `3` | `PROCEED_WITH_HUMAN_CHECK` | needs a human signature |
 | `2` | `BLOCK_AUTONOMOUS_ACTION` | **must halt the autonomous action** |
-| `1` | — | call/parameter error (bad JSON, unfilled template, HTTP != 200) |
+| `4` | — | **unreachable** — edge block / network failure; *no verdict exists* |
+| `1` | — | local call/parameter error (bad JSON, unfilled template, non-JSON reply) |
+
+`2` and `4` are deliberately separate. A gate you cannot reach is not a gate —
+but if "cannot reach" and "ruled against you" share an exit code, an operator
+cannot tell "fix the network" from "stop the work". Alert and retry on `4`;
+halt on `2`.
 
 ## Wire it in as a hard gate
 
@@ -73,7 +79,8 @@ contract:
 python skills/vv-gate/scripts/vv_gate.py template microbio_monod -o preds.json
 # ... your harness fills preds.json: y_pred (and optionally y_std = your 1-sigma)
 python skills/vv-gate/scripts/vv_gate.py verify microbio_monod --pred preds.json
-# exit 2 -> pipeline red. exit 3 -> requires review. exit 0 -> proceed.
+# exit 2 -> pipeline red. exit 3 -> requires review.
+# exit 0 -> proceed. exit 4 -> infrastructure: retry, do not read as a verdict.
 ```
 
 GitHub Actions:
@@ -87,6 +94,10 @@ GitHub Actions:
 
 Leave the step **unguarded** — a non-zero exit fails the job. Do not append
 `|| true`.
+
+If `4` becomes noisy in your environment, do **not** swallow it. Retry the step
+or alert on it separately; converting it to success would mean your pipeline
+silently proceeds when nobody adjudicated anything.
 
 ## Commands
 
@@ -114,6 +125,12 @@ deployment instead of tracking `main`.
    `node-fetch`, `axios`, `Go-http-client`, `okhttp` and any explicit custom UA
    are **allowed**. If you re-implement the client, set a UA. `vv_gate.py`
    already sends `SwarmLabs-VVGate/1.0 (+https://swarmlabs.tools)`.
+   **The block is not deterministic** — the same explicit UA is served on one
+   attempt and 403'd on the next. Measured on GitHub Actions: two live jobs in
+   the same minute, running byte-identical code, went green and red together
+   while both offline jobs stayed green. So a single 1010 must never be read as
+   "the service is broken". `vv_gate.py` retries it like a transient failure and
+   only then reports exit `4`.
 2. **`x` must be byte-identical to the published held-out `x`.** Any point
    whose `x` differs by more than `1e-6` is rejected with `400` and the offending
    `index`. Do not resample, reorder, or normalise. Use `template` as the base.
@@ -160,5 +177,5 @@ State these honestly when you present results:
 |---|---|
 | `scripts/vv_gate.py` | the client (stdlib only, single file) |
 | `references/gate-semantics.md` | thresholds, verdict→gate mapping, provenance, UA probe results |
-| `tests/run_selftest.py` | runs `selftest` and asserts exit code + required fields |
+| `tests/run_selftest.py` | live smoke test: exit-code mapping, fail-closed semantics, provenance, dual chains, unreachability — plus a local fake edge that reproduces the non-deterministic `1010` |
 | `tests/check_stdlib_only.py` | CI guard for the stdlib-only invariant |
