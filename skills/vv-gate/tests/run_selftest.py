@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import threading
+import urllib.error
 import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -45,7 +46,22 @@ def load_module():
     return mod
 
 
-def main() -> int:
+def _is_transient(exc: BaseException) -> bool:
+    """True if this exception means 'no verdict was produced', i.e. retryable.
+
+    Groups C–H talk to the deployed service. When it is temporarily
+    unreachable, that must **not** be reported as a behavioural regression —
+    reporting it as one teaches people to ignore red, which is worse than not
+    testing. Exit `4` carries the distinction so CI can retry the step.
+    """
+    if isinstance(exc, (mod.EdgeBlocked, mod.BadResponse, urllib.error.URLError)):
+        return True
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in mod.TRANSIENT_STATUS:
+        return True
+    return False
+
+
+def _main() -> int:
     if not os.path.exists(SCRIPT):
         print(f"vv_gate.py not found at {SCRIPT}")
         return 1
@@ -82,6 +98,49 @@ def main() -> int:
           f"true transient statuses still retried: {mod.TRANSIENT_STATUS}")
     check(400 not in mod.TRANSIENT_STATUS and 404 not in mod.TRANSIENT_STATUS,
           "verdict statuses (400/404) are never retried")
+
+    print("[B3] a 200 with an EMPTY body is retried, then reported as unreachable")
+    # CI run #28/#30 failure, reduced to a deterministic test. The runner logged:
+    #   GET /reports/benchmark/bio_logistic.json -> json.loads: Expecting value:
+    #   line 1 column 1 (char 0)
+    # i.e. HTTP 200 with a zero-length body. In the MCP channel the same anomaly
+    # surfaced as a bogus 404 unknown_scenario. Both are "no verdict", not "a
+    # verdict", and the old client turned the first into an unhandled traceback.
+
+    class FakeEmpty(http.server.BaseHTTPRequestHandler):
+        hits = 0
+
+        def do_GET(self):
+            type(self).hits += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    saved_sleep = mod._sleep
+    mod._sleep = lambda i, retry_after=None: None      # keep the test instant
+    srv2 = http.server.HTTPServer(("127.0.0.1", 0), FakeEmpty)
+    try:
+        threading.Thread(target=srv2.serve_forever, daemon=True).start()
+        buf5 = io.StringIO()
+        with redirect_stdout(buf5), redirect_stderr(buf5):
+            rc_empty = mod.main(["--base", f"http://127.0.0.1:{srv2.server_address[1]}",
+                                 "scenarios"])
+        out5 = buf5.getvalue()
+    finally:
+        srv2.shutdown()
+        srv2.server_close()
+        mod._sleep = saved_sleep
+    check(rc_empty == 4, f"empty-body 200 -> exit {rc_empty} (expected 4)")
+    check(FakeEmpty.hits == mod.MAX_ATTEMPTS,
+          f"retried {FakeEmpty.hits}x (expected {mod.MAX_ATTEMPTS}) — an anomaly, so retry it")
+    check("no usable JSON body" in out5 or "empty body" in out5.lower(),
+          "stderr names the anomaly instead of a bare JSONDecodeError traceback")
+    check("Expecting value" not in out5,
+          "no raw JSONDecodeError escapes to the caller")
 
     print("[C] live selftest")
     buf = io.StringIO()
@@ -230,6 +289,20 @@ def main() -> int:
         return 1
     print("ALL CHECKS PASSED")
     return 0
+
+
+def main() -> int:
+    try:
+        return _main()
+    except Exception as e:                      # noqa: BLE001 - classification is the point
+        if not _is_transient(e):
+            raise
+        print()
+        print(f"UNREACHABLE: {type(e).__name__}: {e}")
+        print("A live group could not reach the adjudicator, so this run produced no "
+              "verdict. Exiting 4 so CI retries the step instead of reporting a "
+              "regression that did not happen. Do NOT map this to success.")
+        return 4
 
 
 if __name__ == "__main__":
