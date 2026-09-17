@@ -147,6 +147,15 @@ deployment instead of tracking `main`.
 6. **The ledger carries provenance.** `engine.git_commit`, `engine.all_digest`,
    `oracle_digest` let you tell whether the gate you just consulted matches the
    code you think you're trusting.
+7. **A 2xx is not automatically an answer.** `/reports/benchmark/<key>.json` was
+   measured answering `200` with a **zero-length body**; `json.loads` then raises
+   `Expecting value: line 1 column 1`, which looks like a bug in your client and
+   is not. Parse every response and treat "nothing to parse" as a transport
+   anomaly worth retrying. `vv_gate.py` does this and then exits `4`.
+8. **`503 asset_unavailable` means "we could not read our own data" — it is not
+   a bad scenario key.** Do not translate it into "unknown scenario" in your own
+   client. It carries `retryable: true`; `404 unknown_scenario` is the only
+   response that means the key does not exist.
 
 Never send a `x` that you modified "to make it fit". A mis-aligned submission
 is rejected rather than silently scored — that is deliberate.
