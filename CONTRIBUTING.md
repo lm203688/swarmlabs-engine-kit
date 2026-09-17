@@ -24,12 +24,20 @@ for anything time-sensitive.
 # 1. syntax, all Python in the repo
 python -m compileall -q src mcp skills examples
 
-# 2. the live smoke test (network — it talks to the deployed service)
+# 2. stdlib-only invariant inside skills/vv-gate/ (the CI-enforced hard line)
+python skills/vv-gate/tests/check_stdlib_only.py
+
+# 3. the live smoke test (network — it talks to the deployed service)
 python skills/vv-gate/tests/run_selftest.py
 
-# 3. the shipped client's own smoke test
+# 4. the shipped client's own smoke test
 python skills/vv-gate/scripts/vv_gate.py selftest
 ```
+
+`check_stdlib_only.py` fails on any non-stdlib import under `skills/vv-gate/`.
+It is deliberately mechanical: a third-party import there would not even show
+up in the live smoke test on a machine that happens to have the dependency, so
+review is not a sufficient check.
 
 `tests/run_selftest.py` asserts the things that tend to silently rot:
 the verdict→gate mapping is fail-closed, `ERROR` has no permissive exit code,
