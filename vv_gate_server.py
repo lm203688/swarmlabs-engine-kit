@@ -48,51 +48,162 @@ CANNOT:
 
 Transport note: Cloudflare in front of swarmlabs.tools rejects requests with an
 empty User-Agent and with the stdlib default `Python-urllib/x.y`
-(`403 error code: 1010`). This file always sends an explicit UA.
+(`403 error code: 1010`). This file always sends an explicit UA, and - because
+the block is **not deterministic** - retries it like a transient failure.
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 SERVER_NAME = "swarmlabs-gate"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSION = "2024-11-05"
 DEFAULT_BASE = os.environ.get("SWARMLABS_BASE", "https://swarmlabs.tools").rstrip("/")
 USER_AGENT = f"{SERVER_NAME}/{SERVER_VERSION} (+https://swarmlabs.tools)"
 
 GATE_EXIT = {"PROCEED": 0, "PROCEED_WITH_HUMAN_CHECK": 3, "BLOCK_AUTONOMOUS_ACTION": 2}
 
+#: Same transport contract as `skills/vv-gate/scripts/vv_gate.py`, deliberately
+#: duplicated rather than imported: this server must be a single self-contained
+#: file that a consumer can drop into an MCP config without a checkout.
+#:
+#: `403 + error code 1010` is Cloudflare's Browser-Integrity rejection. Measured
+#: to be **non-deterministic**: the same explicit UA is served on one attempt and
+#: blocked on the next (two live CI jobs went green and red together in the same
+#: minute on byte-identical code). So it is retried, and only a persistent block
+#: is reported - as *unreachable*, never as a verdict.
+TRANSIENT_STATUS = (429, 500, 502, 503, 504)
+BLOCKED_EDGE_CODE = "1010"
+MAX_ATTEMPTS = 4
+BACKOFF_S = (1.5, 4.0, 9.0)
+#: Mirrors vv_gate.py: `4` means "no verdict exists", distinct from BLOCK (`2`).
+EXIT_UNREACHABLE = 4
+
+_TRANSPORT = {"retries": 0, "edge_blocks": 0, "last_status": None}
+
+#: Errors that mean "we never reached the adjudicator", i.e. no verdict exists.
+UNREACHABLE_ERRORS = ("edge_blocked", "network_error")
+
+
+def _is_edge_block(status, raw) -> bool:
+    return status == 403 and BLOCKED_EDGE_CODE in (raw or "")
+
+
+def _sleep(i, retry_after=None):
+    delay = BACKOFF_S[min(i, len(BACKOFF_S) - 1)]
+    if retry_after:
+        try:
+            delay = max(delay, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    time.sleep(delay)
+
 
 # ------------------------------------------------------------------ transport
 def _request(base, path, payload=None, timeout=90.0):
+    """Returns (status, body).
+
+    Retries `429/5xx`, network errors and `403/1010` with backoff. `400/404/405`
+    come back immediately: they are judgements about the request, and retrying a
+    malformed submission would be pointless.
+
+    A persistent edge block returns a structured body rather than raising, since
+    an MCP tool result has to be machine-readable for the model that reads it.
+    """
     url = base + path
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if data:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data,
-                                 method="POST" if data else "GET", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+    method = "POST" if data else "GET"
+
+    last = None
+    saw_edge = False
+    for i in range(MAX_ATTEMPTS):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, {"error": "non_json_response", "raw": raw[:400]}
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            edge = _is_edge_block(e.code, raw)
+            if edge:
+                _TRANSPORT["edge_blocks"] += 1
+                saw_edge = True
+            else:
+                saw_edge = False
+            if e.code not in TRANSIENT_STATUS and not edge:
+                try:
+                    return e.code, json.loads(raw)
+                except Exception:
+                    return e.code, {"error": "non_json_response", "raw": raw[:400]}
+            _TRANSPORT["last_status"] = e.code
+            _TRANSPORT["retries"] = i
+            try:
+                body = json.loads(raw)
+            except Exception:
+                body = {"raw": raw[:400]}
+            last = (e.code, body)
+            if i < MAX_ATTEMPTS - 1:
+                _sleep(i, e.headers.get("Retry-After") if e.headers else None)
+        except urllib.error.URLError as e:
+            _TRANSPORT["last_status"] = "URLError"
+            _TRANSPORT["retries"] = i
+            saw_edge = False
+            last = (0, {"error": "network_error", "reason": str(getattr(e, "reason", e))})
+            if i < MAX_ATTEMPTS - 1:
+                _sleep(i)
+        except (TimeoutError, OSError) as e:
+            _TRANSPORT["last_status"] = type(e).__name__
+            _TRANSPORT["retries"] = i
+            saw_edge = False
+            last = (0, {"error": "network_error", "reason": f"{type(e).__name__}: {e}"})
+            if i < MAX_ATTEMPTS - 1:
+                _sleep(i)
+
+    status, body = last
+    if saw_edge:
+        return status, {
+            "error": "edge_blocked",
+            "status": status,
+            "attempts": MAX_ATTEMPTS,
+            "user_agent": USER_AGENT,
+            "edge_code": BLOCKED_EDGE_CODE,
+        }
+    return status, body
+
+
+def _unavailable(what, st, d):
+    """Uniform 'no usable answer' result, with unreachability labelled.
+
+    A tool that returns `gate_unavailable` for both a 404 and a Cloudflare block
+    is worse than useless: the model cannot tell "you asked for something that
+    does not exist" from "retry in a minute".
+    """
+    out = {"error": f"{what}_unavailable", "status": st}
+    if isinstance(d, dict) and d.get("error") in UNREACHABLE_ERRORS:
+        out.update({"unreachable": True, "retryable": True,
+                    "exit_code": EXIT_UNREACHABLE,
+                    "note": ("No verdict was produced: the adjudicator was not reached. "
+                             f"Cloudflare answered 403/1010 on all {MAX_ATTEMPTS} attempts "
+                             "and the block is not deterministic. Treat as infrastructure "
+                             "(retry / alert) - never as PROCEED (0) and never as BLOCK (2).")})
+        if d.get("reason"):
+            out["reason"] = d["reason"]
+    return out
 
 
 # ---------------------------------------------------------------------- tools
 def tool_list_scenarios(base):
     st, idx = _request(base, "/v3/benchmark")
     if st != 200:
-        return {"error": "benchmark_unavailable", "status": st}
+        return _unavailable("benchmark", st, idx)
     rows = idx.get("scenarios") or {}
     if isinstance(rows, list):
         rows = {r.get("key") or r.get("scenario_key"): r for r in rows}
@@ -107,6 +218,8 @@ def tool_gate_decision(base, args):
     key = (args or {}).get("scenario_key")
     path = f"/v3/gate/{urllib.parse.quote(key)}" if key else "/v3/gate"
     st, d = _request(base, path)
+    if st != 200:
+        return _unavailable("gate", st, d)
     d = dict(d) if isinstance(d, dict) else {"body": d}
     d["exit_code"] = GATE_EXIT.get(d.get("gate"), None)
     return d
@@ -115,7 +228,7 @@ def tool_gate_decision(base, args):
 def tool_ledger_provenance(base):
     st, d = _request(base, "/v3/gate")
     if st != 200:
-        return {"error": "ledger_unavailable", "status": st}
+        return _unavailable("ledger", st, d)
     return {k: d.get(k) for k in
             ("name", "version", "generated_at_utc", "standard", "policy",
              "counts", "total", "n_blocked", "n_human_check_required", "provenance")}
@@ -130,8 +243,12 @@ def tool_wet_lab_anchors(base, args):
                     "hint": "call with no key to list; both literature anchor keys "
                             "(e.g. ecoli_glucose_Ks) and scenario keys "
                             "(e.g. microbio_monod) are accepted"}
+        if st != 200:
+            return _unavailable("anchors", st, d)
         return d
     st, d = _request(base, "/v3/anchors")
+    if st != 200:
+        return _unavailable("anchors", st, d)
     return {"summary": d.get("summary"), "anchors": d.get("anchors"),
             "n_scenarios": len(d.get("scenarios") or []), "note": d.get("note")}
 
@@ -142,6 +259,8 @@ def tool_held_out_template(base, args):
         return {"error": "bad_request", "message": "scenario_key is required"}
     st, b = _request(base, f"/reports/benchmark/{urllib.parse.quote(key)}.json")
     if st != 200:
+        if isinstance(b, dict) and b.get("error") in UNREACHABLE_ERRORS:
+            return _unavailable("template", st, b)
         return {"error": "unknown_scenario", "scenario_key": key, "status": st}
     X = b.get("X") or []
     return {"scenario_key": key, "dim": b.get("dim"), "n_points": len(X),
@@ -165,6 +284,10 @@ def tool_verify_prediction(base, args):
                 "message": "no filled predictions: y_pred is null everywhere. "
                            "Call get_held_out_template first."}
     st, body = _request(base, "/v3/verify", {"scenario_key": key, "predictions": preds})
+    if isinstance(body, dict) and body.get("error") in UNREACHABLE_ERRORS:
+        # No verdict happened. Say so instead of letting the model read a
+        # missing `gate` field as an implicit pass.
+        return _unavailable("verify", st, body)
     if not isinstance(body, dict):
         return {"error": "unexpected_response", "status": st, "body": str(body)[:300]}
     out = dict(body)
@@ -381,6 +504,66 @@ def selftest(base):
     r = handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                 "params": {"name": "nope", "arguments": {}}}, base)
     chk("error" in r, "unknown tool -> JSON-RPC error, transport survives")
+
+    # --- unreachability must be distinguishable from a verdict -------------
+    chk(_is_edge_block(403, "error code: 1010") is True, "403/1010 classified as an edge block")
+    chk(_is_edge_block(403, "Forbidden") is False, "a plain 403 is a real rejection, not an edge block")
+    chk(_is_edge_block(404, "1010") is False, "404 is never an edge block")
+    chk(EXIT_UNREACHABLE == 4 and EXIT_UNREACHABLE not in (2, 3),
+        "unreachable exit code is 4, distinct from BLOCK (2)")
+
+    import http.server
+    import threading
+
+    class FakeEdge(http.server.BaseHTTPRequestHandler):
+        hits = 0
+
+        def _reply(self):
+            type(self).hits += 1
+            body = b"<html><body><h1>Error 1010</h1>error code: 1010</body></html>"
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _reply
+
+        def log_message(self, *a):
+            pass
+
+    # MAX_ATTEMPTS stays real so the retry count is meaningful; only the
+    # back-off is monkeypatched away so the selftest does not sleep ~15s.
+    _saved_sleep = globals()["_sleep"]
+    globals()["_sleep"] = lambda i, retry_after=None: None
+    srv = http.server.HTTPServer(("127.0.0.1", 0), FakeEdge)
+    try:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        r = handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                    "params": {"name": "gate_decision", "arguments": {}}},
+                   f"http://127.0.0.1:{port}")
+        edge = json.loads(r["result"]["content"][0]["text"])
+        chk(edge.get("unreachable") is True, f"edge block surfaces unreachable=True ({edge.get('error')})")
+        chk(edge.get("retryable") is True, "edge block is marked retryable")
+        chk(edge.get("exit_code") == EXIT_UNREACHABLE,
+            f"edge block carries exit_code={edge.get('exit_code')}")
+        chk(edge.get("gate") is None,
+            "no gate field is invented on an unreachable result (no implicit pass)")
+        chk(FakeEdge.hits == MAX_ATTEMPTS,
+            f"retried {FakeEdge.hits}x (expected {MAX_ATTEMPTS})")
+        chk(_TRANSPORT["edge_blocks"] > 0, f"transport counter edge_blocks={_TRANSPORT['edge_blocks']}")
+
+        r = handle({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                    "params": {"name": "list_scenarios", "arguments": {}}},
+                   "http://127.0.0.1:59999")
+        dead = json.loads(r["result"]["content"][0]["text"])
+        chk(dead.get("unreachable") is True, f"a dead base surfaces unreachable=True ({dead.get('error')})")
+        chk(dead.get("exit_code") == EXIT_UNREACHABLE, "a dead base carries exit_code=4, not a verdict")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        globals()["_sleep"] = _saved_sleep
 
     print("SELFTEST " + ("OK" if ok else "FAILED"))
     return 0 if ok else 1
