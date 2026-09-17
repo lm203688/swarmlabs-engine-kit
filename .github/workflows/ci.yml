@@ -32,51 +32,27 @@ jobs:
         run: python -m compileall -q src mcp skills examples
 
       - name: JSON assets parse
-        run: |
-          python - <<'PY'
-          import json, pathlib
-          for p in pathlib.Path('.').rglob('*.json'):
-              if '.git' in p.parts:
-                  continue
-              json.loads(p.read_text(encoding='utf-8'))
-              print('ok', p)
-          PY
+        # 一行式，避免 YAML block scalar 的缩进被原样喂给 python 引发的
+        # IndentationError 隐患（heredoc 在本文件里能跑通，但依赖缩进恰好合法，
+        # 不值得把正确性押在缩进上）。
+        run: >-
+          python -c "import json,pathlib; ps=[p for p in pathlib.Path('.').rglob('*.json') if '.git' not in p.parts];
+          [json.loads(p.read_text(encoding='utf-8')) for p in ps]; print('parsed',len(ps),'json files')"
 
   no-dependencies-in-gate:
     # Hard invariant: skills/vv-gate/ must run with no build step inside someone
-    # else's harness. Enforce it mechanically so review does not have to.
+    # else's harness. Enforced mechanically so review does not have to be the
+    # thing that catches it — a third-party import would not even show up in the
+    # live smoke test on a machine that happens to have the dependency.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
       - name: Assert vv-gate imports stdlib only
-        run: |
-          python - <<'PY'
-          import ast, pathlib, sys
-
-          ALLOWED = {
-              'argparse', 'json', 'os', 'sys', 'urllib', 'typing', 'pathlib',
-              'io', 'contextlib', 'importlib', 'hashlib', 'time', 're', 'math',
-              'collections', 'dataclasses', 'functools', 'itertools', 'textwrap',
-              'shlex', 'subprocess', 'tempfile', 'random', 'statistics', 'logging',
-              'datetime', 'enum', 'operator', 'traceback', 'copy', 'unittest',
-          }
-          bad = []
-          for f in pathlib.Path('skills/vv-gate').rglob('*.py'):
-              tree = ast.parse(f.read_text(encoding='utf-8'), filename=str(f))
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.Import):
-                      names = [a.name.split('.')[0] for a in node.names]
-                  elif isinstance(node, ast.ImportFrom):
-                      names = [(node.module or '').split('.')[0]] if node.level == 0 else []
-                  else:
-                      continue
-                  for n in names:
-                      if n and n not in ALLOWED:
-                          bad.append(f'{f}:{node.lineno} imports {n!r}')
-          for b in bad:
-              print('BLOCKED', b)
-          sys.exit(1 if bad else 0)
-          PY
+        run: python skills/vv-gate/tests/check_stdlib_only.py
 
   vv-gate-selftest:
     needs: lint-and-syntax
