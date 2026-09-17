@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "SwarmLabs Engine Kit"
+abstract: >-
+  Open-source client SDK, reference MCP server, and agent Skills for the
+  SwarmLabs physics-informed scientific-experiment automation engine. Includes
+  vv-gate: a dependency-free, fail-closed verification gate that independently
+  adjudicates a numeric prediction against a published held-out set and
+  literature anchors, returning PROCEED / PROCEED_WITH_HUMAN_CHECK /
+  BLOCK_AUTONOMOUS_ACTION.
+type: software
+authors:
+  - name: "SwarmLabs"
+version: "0.2.0"
+date-released: "2026-09-17"
+license: MIT
+repository-code: "https://github.com/lm203688/swarmlabs-engine-kit"
+url: "https://swarmlabs.tools"
+keywords:
+  - verification-and-validation
+  - uncertainty-quantification
+  - scientific-machine-learning
+  - agent-infrastructure
+  - model-context-protocol
+  - reproducibility
+  - research-integrity
