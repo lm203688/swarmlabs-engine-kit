@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue
+    url: https://github.com/lm203688/swarmlabs-engine-kit/security/advisories/new
+    about: Report privately. Especially anything that makes a gate MORE permissive than it should be.
+  - name: How the gate decides (read first)
+    url: https://github.com/lm203688/swarmlabs-engine-kit/blob/main/skills/vv-gate/references/gate-semantics.md
+    about: Thresholds, the verdict→gate map, provenance, and the published disagreements between the two evidence chains.
+  - name: Governance, and the bus-factor-1 disclosure
+    url: https://github.com/lm203688/swarmlabs-engine-kit/blob/main/GOVERNANCE.md
+    about: One maintainer, no entity, no SLA. Read this before depending on the hosted endpoints.
