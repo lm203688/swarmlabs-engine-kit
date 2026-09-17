@@ -8,49 +8,70 @@ and tags are immutable.
 
 ### Fixed
 
-- **A Cloudflare `403 error code 1010` could make the gate intermittently
-  unavailable on both channels, and there was no way to tell that apart from a
-  verdict.** The block is **not deterministic**: CI run `#23` ran four jobs all
-  green; run `#24`, with a byte-identical `vv_gate.py` (only docs had changed),
-  had its two *live* jobs (`vv-gate-selftest`, `vv-gate-server-selftest`) go red
-  in the same minute, while the two *offline* jobs stayed green both times. A
-  local loop of the same test passed three times in a row.
+- **Two upstream anomalies that were indistinguishable from a verdict.** Both
+  were found by reading the real GitHub Actions logs after the live jobs went
+  red on code that had just gone green (run `#29` and `#30` carried
+  byte-identical code and differed only in a docs file; one passed, one failed).
+
+  1. **`403 error code: 1010`.** Cloudflare's Browser-Integrity block is
+     **non-deterministic**: the same explicit User-Agent is served on one attempt
+     and blocked on the next. The two *offline* CI jobs stayed green 4/4 times
+     while the two *live* jobs each failed intermittently, never in the same run.
+  2. **`200` with an EMPTY body.** Runner log:
+     `GET /reports/benchmark/bio_logistic.json` →
+     `json.loads: Expecting value: line 1 column 1 (char 0)`. In the CLI channel
+     that became an unhandled `JSONDecodeError` traceback that looks like a bug in
+     this client, and in the MCP channel the same anomaly surfaced as a **bogus
+     `404 unknown_scenario`** — i.e. the service asserted that a scenario it
+     publishes does not exist.
 
   The failure mode mattered more than the flake: a client that cannot reach the
-  adjudicator has **no verdict**, yet the old code returned the same `1` it uses
-  for "you passed a bad file", and the MCP server returned `gate_unavailable`
-  for both a real 404 and an edge block.
+  adjudicator has **no verdict**, yet both channels had exit codes that conflated
+  that with "the gate said no" (CLI returned `1`, MCP returned `*_unavailable`).
 
-  - `scripts/vv_gate.py` now retries `403/1010` alongside `429/5xx` and network
-    errors, and on a persistent block raises a distinct `EdgeBlocked` that maps
-    to a **new exit code `4` — "unreachable"**, never `2` (BLOCK) and never `0`.
-    A plain `403` that does *not* carry `1010` is still returned immediately: it
-    is a real rejection, not a coin flip.
-  - `vv_gate_server.py` gets the same transport contract and now labels
+  - `scripts/vv_gate.py` now retries `403/1010`, `429/5xx`, network errors **and
+    a 2xx with no usable JSON body**; a persistent one raises either `EdgeBlocked`
+    or `BadResponse`, both mapping to a **new exit code `4` — "unreachable"**,
+    never `2` (BLOCK) and never `0`. A plain `403` without `1010` is still
+    returned immediately: it is a real rejection, not a coin flip.
+  - `vv_gate_server.py` gets the same transport contract and labels
     unreachability explicitly (`unreachable: true`, `retryable: true`,
-    `exit_code: 4`, plus a note) instead of collapsing it into
-    `*_unavailable`. No `gate` field is invented, so a model reading the result
-    cannot mistake "we never asked" for an implicit pass.
-  - `TRANSIENT_STATUS` is deliberately *not* widened to include `403`; the retry
-    is keyed on the `1010` body, so a blanket 403 stays fatal.
+    `exit_code: 4`, plus `cause`). No `gate` field is invented, so a model
+    reading the result cannot mistake "we never asked" for an implicit pass.
+    The 503 family (`asset_unavailable`, `service_unavailable`,
+    `policy_unavailable`) is folded in: the server failing to read its own data
+    or thresholds is also "no verdict".
+  - `.github/workflows/ci.yml`: the two live jobs **retry once on exit 4**, and
+    only on exit 4. A behavioural regression (`1`) still fails immediately; no
+    `continue-on-error`, no `|| true`. A retry driven by an exit code that means
+    "no answer was produced" is honest; `continue-on-error` would hide real
+    regressions, and mapping `4` to success would let the pipeline proceed when
+    nobody adjudicated anything.
 
 ### Added
 
-- **Deterministic regression tests for the above**, in both channels, because a
-  pure-function assertion would not have caught the original bug:
-  - `tests/run_selftest.py` group `[J]` stands up a local HTTP server that always
-    answers `403 error code: 1010` and asserts the client retried exactly
-    `MAX_ATTEMPTS` times and exited `4`; it then flips the fake to a plain `403`
-    and asserts a **single** attempt. That second half is the control case —
-    without it, "we retry 1010" and "we retry every 403" look identical in logs.
-  - `vv_gate_server.py --selftest` runs the same experiment against
-    `gate_decision` and additionally checks a dead base
-    (`127.0.0.1:59999`) reports `exit_code: 4` with no invented `gate`.
-  - `tests/run_selftest.py` group `[I]` asserts an unreachable base exits `4`
-    and never `0/2/3`.
+- **Deterministic regression tests for both anomalies, in both channels**,
+  because a pure-function assertion would not have caught either bug. Every fake
+  upstream is a real socket on `127.0.0.1`, so the retry loop, the exception
+  types and the exit code are all exercised:
+  - Group `[B3]` — a local server that answers `200` with `Content-Length: 0`;
+    asserts `4` assertions incl. retry count and *"no raw `JSONDecodeError`
+    escapes to the caller"*.
+  - Group `[J]` — a local server that always answers `403 error code: 1010`;
+    asserts the client retried exactly `MAX_ATTEMPTS` times and exited `4`, then
+    flips the fake to a plain `403` and asserts a **single** attempt. That second
+    half is the control case — without it, "we retry 1010" and "we retry every
+    403" look identical in the logs.
+  - `vv_gate_server.py --selftest` runs both experiments against
+    `gate_decision`, checks `bad_response` survives as `cause`, and checks a dead
+    base (`127.0.0.1:59999`) reports `exit_code: 4` with no invented `gate`.
+  - Group `[I]` asserts an unreachable base exits `4` and never `0/2/3`.
+  - Both live selftests now exit **4** rather than tracebacking when a live group
+    is unreachable, and say so: *"Any FAIL above is a consequence of that
+    unreachability, not a behavioural regression."*
   - `tests/check_stdlib_only.py` allow-list gains `http`, `socket`, `threading`
     (all stdlib — the invariant is unchanged); its scope already covered
-    `vv_gate_server.py`, which is how this was caught.
+    `vv_gate_server.py`, which is how the empty-body path was noticed at all.
 - Group `[H]` now guards the scenario-level `/v3/anchors/{scenario_key}`
   regression: that endpoint used to 404 on **every** key because the Worker
   indexed a JSON *array* with a string key. It now asserts both evidence chains
@@ -58,10 +79,23 @@ and tags are immutable.
 
 ### Changed
 
-- `USER_AGENT`-related consumer guidance is now "the block is probabilistic"
-  rather than "set a UA and you are fine" — in `SKILL.md` and in
-  `references/gate-semantics.md` §6.1/§6.2b, with the CI evidence recorded.
+- Consumer guidance is now "these upstream anomalies are probabilistic, and an
+  unreachable gate is not a verdict" rather than "set a UA and you are fine" —
+  in `SKILL.md` and in `references/gate-semantics.md` §6.1/§6.2b, with the CI
+  evidence recorded next to the claim.
 - `vv_gate_server.py` `SERVER_VERSION` → `1.1.0`.
+
+### Related (server side, not in this repo)
+
+- `swarmlabs.tools`' `/v3/verify` used to answer `404 unknown_scenario` when the
+  held-out asset merely failed to load, because its `fetchAssetJson` helper
+  collapsed "absent" and "unreadable" into the same `null`. It now reads via a
+  strict `readAsset` that separates `absent` from `empty_body` / `bad_json` /
+  `status_NNN` / `fetch_error`, retries the unreadable case once, and returns
+  **`503 asset_unavailable` with `retryable: true`** instead of asserting that a
+  published scenario does not exist. The same helper now guards the `/v3/*`
+  static passthrough and the V&V half of the dual-chain join, which previously
+  claimed "no gate-ledger entry" when the ledger was simply unreadable.
 
 ## [0.2.0] — 2026-09-17
 
