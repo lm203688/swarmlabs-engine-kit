@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""SwarmLabs verification-gate MCP server — zero-dependency edition.
+
+Exposes the public SwarmLabs gate as [MCP](https://modelcontextprotocol.io)
+tools, so any MCP host (Claude Desktop, Cursor, your own agent runtime) can ask,
+*before acting on a number*:
+
+    "Is this claim trustworthy right now - and if not, why?"
+
+Why zero dependencies matters here
+----------------------------------
+The obvious implementation is `pip install mcp` + FastMCP. We deliberately did
+not do that. An MCP server is newline-delimited JSON-RPC 2.0 over stdio - about
+a hundred lines. Shipping it with **no install step at all** means it can be
+dropped into a host config and just work, on a machine with nothing but Python.
+That is the same invariant `skills/vv-gate/` holds, and for the same reason: a
+gate you cannot easily run is a gate you do not have.
+
+    python vv_gate_server.py              # stdio MCP server
+    python vv_gate_server.py --selftest   # offline-ish smoke test against the live API
+
+MCP host config:
+
+    { "mcpServers": { "swarmlabs-gate": {
+        "command": "python",
+        "args": ["/abs/path/to/vv_gate_server.py"] } } }
+
+What this server can and cannot do (honest boundary)
+---------------------------------------------------
+CAN:
+  * list the published scenarios and their verdict/gate,
+  * return the full gate ledger, with engine/oracle digests,
+  * return the wet-lab anchor chain (the second evidence chain), including where
+    it CONTRADICTS the V&V chain,
+  * hand out the held-out input skeleton for a scenario,
+  * **verify your own predictions** against the published held-out set - we hold
+    the ground truth, you do not - and return R^2 / coverage / kappa plus a
+    fail-closed `PROCEED | PROCEED_WITH_HUMAN_CHECK | BLOCK_AUTONOMOUS_ACTION`.
+
+CANNOT:
+  * score an arbitrary grid of your own choosing. Only the published held-out
+    set is scored. That is what makes it a gate rather than a benchmarking
+    service, and it is a deliberate limit, not a gap.
+  * validate the physics. R^2 measures fidelity of a surrogate to its oracle.
+    The anchor chain is the chain that can catch an oracle that is physically
+    wrong; read both, and gate on the more conservative one.
+
+Transport note: Cloudflare in front of swarmlabs.tools rejects requests with an
+empty User-Agent and with the stdlib default `Python-urllib/x.y`
+(`403 error code: 1010`). This file always sends an explicit UA.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SERVER_NAME = "swarmlabs-gate"
+SERVER_VERSION = "1.0.0"
+PROTOCOL_VERSION = "2024-11-05"
+DEFAULT_BASE = os.environ.get("SWARMLABS_BASE", "https://swarmlabs.tools").rstrip("/")
+USER_AGENT = f"{SERVER_NAME}/{SERVER_VERSION} (+https://swarmlabs.tools)"
+
+GATE_EXIT = {"PROCEED": 0, "PROCEED_WITH_HUMAN_CHECK": 3, "BLOCK_AUTONOMOUS_ACTION": 2}
+
+
+# ------------------------------------------------------------------ transport
+def _request(base, path, payload=None, timeout=90.0):
+    url = base + path
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if data:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data,
+                                 method="POST" if data else "GET", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"error": "non_json_response", "raw": raw[:400]}
+
+
+# ---------------------------------------------------------------------- tools
+def tool_list_scenarios(base):
+    st, idx = _request(base, "/v3/benchmark")
+    if st != 200:
+        return {"error": "benchmark_unavailable", "status": st}
+    rows = idx.get("scenarios") or {}
+    if isinstance(rows, list):
+        rows = {r.get("key") or r.get("scenario_key"): r for r in rows}
+    out = [{"scenario_key": k, "verdict": v.get("verdict"), "gate": v.get("gate"),
+            "dim": v.get("dim"), "n_test": v.get("n_test")}
+           for k, v in sorted(rows.items())]
+    return {"total": idx.get("total"), "total_test_points": idx.get("total_test_points"),
+            "verdict_counts": idx.get("verdict_counts"), "scenarios": out}
+
+
+def tool_gate_decision(base, args):
+    key = (args or {}).get("scenario_key")
+    path = f"/v3/gate/{urllib.parse.quote(key)}" if key else "/v3/gate"
+    st, d = _request(base, path)
+    d = dict(d) if isinstance(d, dict) else {"body": d}
+    d["exit_code"] = GATE_EXIT.get(d.get("gate"), None)
+    return d
+
+
+def tool_ledger_provenance(base):
+    st, d = _request(base, "/v3/gate")
+    if st != 200:
+        return {"error": "ledger_unavailable", "status": st}
+    return {k: d.get(k) for k in
+            ("name", "version", "generated_at_utc", "standard", "policy",
+             "counts", "total", "n_blocked", "n_human_check_required", "provenance")}
+
+
+def tool_wet_lab_anchors(base, args):
+    key = (args or {}).get("key")
+    if key:
+        st, d = _request(base, f"/v3/anchors/{urllib.parse.quote(key)}")
+        if st == 404:
+            return {"error": "unknown_key", "key": key, "status": 404,
+                    "hint": "call with no key to list; both literature anchor keys "
+                            "(e.g. ecoli_glucose_Ks) and scenario keys "
+                            "(e.g. microbio_monod) are accepted"}
+        return d
+    st, d = _request(base, "/v3/anchors")
+    return {"summary": d.get("summary"), "anchors": d.get("anchors"),
+            "n_scenarios": len(d.get("scenarios") or []), "note": d.get("note")}
+
+
+def tool_held_out_template(base, args):
+    key = (args or {}).get("scenario_key")
+    if not key:
+        return {"error": "bad_request", "message": "scenario_key is required"}
+    st, b = _request(base, f"/reports/benchmark/{urllib.parse.quote(key)}.json")
+    if st != 200:
+        return {"error": "unknown_scenario", "scenario_key": key, "status": st}
+    X = b.get("X") or []
+    return {"scenario_key": key, "dim": b.get("dim"), "n_points": len(X),
+            "test_seed": b.get("test_seed"),
+            "predictions": [{"x": X[i], "y_pred": None, "y_std": None} for i in range(len(X))],
+            "note": "Fill y_pred (and optionally y_std = your 1-sigma). Keep x unchanged: "
+                    "/v3/verify rejects mis-aligned points with the offending index."}
+
+
+def tool_verify_prediction(base, args):
+    args = args or {}
+    key = args.get("scenario_key")
+    preds = args.get("predictions")
+    if not key:
+        return {"error": "bad_request", "message": "scenario_key is required"}
+    if not isinstance(preds, list) or not preds:
+        return {"error": "bad_request", "message": "predictions must be a non-empty array"}
+    preds = [p for p in preds if isinstance(p, dict) and p.get("y_pred") is not None]
+    if not preds:
+        return {"error": "bad_request",
+                "message": "no filled predictions: y_pred is null everywhere. "
+                           "Call get_held_out_template first."}
+    st, body = _request(base, "/v3/verify", {"scenario_key": key, "predictions": preds})
+    if not isinstance(body, dict):
+        return {"error": "unexpected_response", "status": st, "body": str(body)[:300]}
+    out = dict(body)
+    out["http_status"] = st
+    out["exit_code"] = GATE_EXIT.get(out.get("gate"))
+    if st == 400:
+        out["note"] = ("fail-closed input check: the submission was refused rather than "
+                       "partially scored. Read n_expected/n_got, or index for misalignment.")
+    if out.get("coverage") is None:
+        out["coverage_note"] = ("coverage is null because y_std was not supplied. "
+                               "Null means NOT EVALUATED, which is not the same as 1.")
+    return out
+
+
+TOOLS = [
+    {
+        "name": "list_scenarios",
+        "description": "List the published held-out scenarios with their verdict and gate. "
+                       "Call this first to find a scenario_key.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "gate_decision",
+        "description": "Static gate decision: what is the current trust state of a scenario? "
+                       "Returns gate (PROCEED / PROCEED_WITH_HUMAN_CHECK / "
+                       "BLOCK_AUTONOMOUS_ACTION) and exit_code. Omit scenario_key for the "
+                       "whole ledger summary.",
+        "inputSchema": {"type": "object",
+                        "properties": {"scenario_key": {"type": "string"}},
+                        "additionalProperties": False},
+    },
+    {
+        "name": "ledger_provenance",
+        "description": "Gate ledger summary plus provenance: engine git commit, engine "
+                       "all_digest/core_digest and oracle_digest. Use it to check whether "
+                       "the gate you are consulting matches the code you think you trust.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "wet_lab_anchors",
+        "description": "The second evidence chain: literature ranges (never point estimates) "
+                       "and the implied parameters recovered by fitting the noise-free "
+                       "oracle. Grades AGREE / NEAR / CONTRADICTED / UNANCHORED. A scenario's "
+                       "V&V chain can say PASS while this chain says CONTRADICTED - read both "
+                       "and gate on the more conservative one.",
+        "inputSchema": {"type": "object",
+                        "properties": {"key": {
+                            "type": "string",
+                            "description": "A literature anchor key (e.g. ecoli_glucose_Ks) or "
+                                           "a scenario key (e.g. microbio_monod). Omit to list."}},
+                        "additionalProperties": False},
+    },
+    {
+        "name": "get_held_out_template",
+        "description": "Fetch a scenario's held-out INPUT points as a fillable skeleton. "
+                       "Fill y_pred (optionally y_std = your 1-sigma) and keep x unchanged, "
+                       "then call verify_prediction.",
+        "inputSchema": {"type": "object",
+                        "properties": {"scenario_key": {"type": "string"}},
+                        "required": ["scenario_key"], "additionalProperties": False},
+    },
+    {
+        "name": "verify_prediction",
+        "description": "THE GATE. Score YOUR predictions on a published held-out set whose "
+                       "ground truth we hold. Returns verdict (PASS/MARGINAL/REFUTED/ERROR), "
+                       "gate, R^2, coverage (only when y_std is supplied), calibration kappa, "
+                       "and exit_code (0 PROCEED / 3 human check / 2 BLOCK). Fail-closed: a "
+                       "misaligned or wrong-length submission is refused, not partially "
+                       "scored; ERROR maps to BLOCK, never to PROCEED.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scenario_key": {"type": "string"},
+                "predictions": {
+                    "type": "array",
+                    "description": "One entry per published held-out point, in published order.",
+                    "items": {"type": "object", "properties": {
+                        "x": {"type": "array", "items": {"type": "number"}},
+                        "y_pred": {"type": "number"},
+                        "y_std": {"type": "number"}},
+                        "required": ["y_pred"]}},
+            },
+            "required": ["scenario_key", "predictions"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+HANDLERS = {
+    "list_scenarios": lambda b, a: tool_list_scenarios(b),
+    "gate_decision": tool_gate_decision,
+    "ledger_provenance": lambda b, a: tool_ledger_provenance(b),
+    "wet_lab_anchors": tool_wet_lab_anchors,
+    "get_held_out_template": tool_held_out_template,
+    "verify_prediction": tool_verify_prediction,
+}
+
+
+# ------------------------------------------------------------------- protocol
+def _ok(mid, result):
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def _err(mid, code, message):
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+def handle(msg, base):
+    """Return a response dict, or None for notifications."""
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method in ("notifications/initialized", "initialized"):
+        return None
+    if method == "initialize":
+        return _ok(mid, {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": ("Independent V&V gate for numeric claims. Reproducible != valid. "
+                            "Use verify_prediction to score your own predictions against a "
+                            "held-out set whose ground truth this server holds; read "
+                            "wet_lab_anchors too, because the two chains are allowed to "
+                            "disagree and you must gate on the more conservative one."),
+        })
+    if method == "ping":
+        return _ok(mid, {})
+    if method == "tools/list":
+        return _ok(mid, {"tools": TOOLS})
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        fn = HANDLERS.get(name)
+        if fn is None:
+            return _err(mid, -32602, f"unknown tool: {name}")
+        try:
+            out = fn(base, args)
+        except Exception as e:  # never kill the transport on a tool error
+            out = {"error": "tool_exception", "detail": f"{type(e).__name__}: {e}"}
+        is_error = isinstance(out, dict) and "error" in out
+        return _ok(mid, {
+            "content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False, indent=2)}],
+            "isError": is_error,
+        })
+    if mid is None:
+        return None
+    return _err(mid, -32601, f"method not found: {method}")
+
+
+def serve(base):
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        resp = handle(msg, base)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+
+def selftest(base):
+    """Drive a real protocol session against the live API."""
+    ok = True
+
+    def chk(cond, label):
+        nonlocal ok
+        print(("  ok   " if cond else "  FAIL ") + label)
+        if not cond:
+            ok = False
+
+    print(f"base = {base}")
+    r = handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, base)
+    chk(r["result"]["serverInfo"]["name"] == SERVER_NAME, "initialize handshake")
+    r = handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, base)
+    names = [t["name"] for t in r["result"]["tools"]]
+    chk(len(names) == 6, f"tools/list -> {names}")
+
+    r = handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "list_scenarios", "arguments": {}}}, base)
+    scen = json.loads(r["result"]["content"][0]["text"])
+    chk(scen.get("total") == 62, f"list_scenarios total={scen.get('total')}")
+    key = (scen.get("scenarios") or [{}])[0].get("scenario_key")
+    chk(bool(key), f"first scenario key = {key}")
+
+    r = handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "gate_decision", "arguments": {"scenario_key": key}}}, base)
+    gd = json.loads(r["result"]["content"][0]["text"])
+    chk(gd.get("gate") in GATE_EXIT, f"gate_decision gate={gd.get('gate')} exit={gd.get('exit_code')}")
+
+    r = handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "ledger_provenance", "arguments": {}}}, base)
+    lp = json.loads(r["result"]["content"][0]["text"])
+    chk(bool((lp.get("provenance") or {}).get("engine", {}).get("all_digest")),
+        "ledger_provenance carries engine.all_digest")
+
+    r = handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "wet_lab_anchors",
+                           "arguments": {"key": "microbio_monod"}}}, base)
+    an = json.loads(r["result"]["content"][0]["text"])
+    chk(an.get("chains_agree") is False,
+        f"dual chain on microbio_monod: vv={((an.get('vv_gate') or {}).get('gate'))} "
+        f"wet_lab={((an.get('wet_lab') or {}).get('gate'))} -> disagree")
+
+    r = handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": "verify_prediction",
+                           "arguments": {"scenario_key": key, "predictions": [{"y_pred": 1.0}]}}}, base)
+    vd = json.loads(r["result"]["content"][0]["text"])
+    chk(vd.get("http_status") == 400, f"wrong-length submission refused (HTTP {vd.get('http_status')})")
+
+    r = handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                "params": {"name": "nope", "arguments": {}}}, base)
+    chk("error" in r, "unknown tool -> JSON-RPC error, transport survives")
+
+    print("SELFTEST " + ("OK" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    base = DEFAULT_BASE
+    if "--base" in argv:
+        base = argv[argv.index("--base") + 1].rstrip("/")
+    if "--selftest" in argv:
+        return selftest(base)
+    if "--help" in argv or "-h" in argv:
+        print(__doc__)
+        return 0
+    serve(base)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
