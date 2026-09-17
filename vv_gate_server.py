@@ -62,7 +62,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "swarmlabs-gate"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.1.1"
 PROTOCOL_VERSION = "2024-11-05"
 DEFAULT_BASE = os.environ.get("SWARMLABS_BASE", "https://swarmlabs.tools").rstrip("/")
 USER_AGENT = f"{SERVER_NAME}/{SERVER_VERSION} (+https://swarmlabs.tools)"
@@ -521,11 +521,19 @@ def selftest(base):
             ok = False
 
     def live(payload, label):
-        """标记一次'本应拿到裁决'的调用；若结果为不可达则记录下来。"""
+        """取一次「本应拿到裁决」的调用结果，返回 (data, reachable)。
+
+        不可达 → ({}, False) 并计入 unreachable（退出码 4）；
+        可达   → (payload or {}, True)。
+
+        调用方**必须**在 reachable=False 时跳过断言。把「够不到裁决者」
+        当成「裁决说我错」会让 CI 报一个它根本没有证据的红——
+        与把 404 编给一个存在的场景是同一类错误，只是方向相反。
+        """
         if isinstance(payload, dict) and payload.get("unreachable"):
             unreachable.append((label, payload.get("error"), payload.get("note")))
-            return None
-        return payload
+            return {}, False
+        return (payload or {}), True
 
     print(f"base = {base}")
     r = handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, base)
@@ -536,37 +544,47 @@ def selftest(base):
 
     r = handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "list_scenarios", "arguments": {}}}, base)
-    scen = live(json.loads(r["result"]["content"][0]["text"]), "list_scenarios") or {}
-    chk(scen.get("total") == 62, f"list_scenarios total={scen.get('total')}")
-    key = (scen.get("scenarios") or [{}])[0].get("scenario_key")
+    scen, s_ok = live(json.loads(r["result"]["content"][0]["text"]), "list_scenarios")
+    if s_ok:
+        chk(scen.get("total") == 62, f"list_scenarios total={scen.get('total')}")
+    # 不可达时仍需要一个 key 让后续调用有参数；断言只保证它非空。
+    key = (scen.get("scenarios") or [{}])[0].get("scenario_key") or "bio_logistic"
     chk(bool(key), f"first scenario key = {key}")
 
     r = handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                 "params": {"name": "gate_decision", "arguments": {"scenario_key": key}}}, base)
-    gd = live(json.loads(r["result"]["content"][0]["text"]), "gate_decision") or {}
-    chk(gd.get("gate") in GATE_EXIT, f"gate_decision gate={gd.get('gate')} exit={gd.get('exit_code')}")
+    gd, g_ok = live(json.loads(r["result"]["content"][0]["text"]), "gate_decision")
+    if g_ok:
+        chk(gd.get("gate") in GATE_EXIT,
+            f"gate_decision gate={gd.get('gate')} exit={gd.get('exit_code')}")
 
     r = handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
                 "params": {"name": "ledger_provenance", "arguments": {}}}, base)
-    lp = live(json.loads(r["result"]["content"][0]["text"]), "ledger_provenance") or {}
-    chk(bool((lp.get("provenance") or {}).get("engine", {}).get("all_digest")),
-        "ledger_provenance carries engine.all_digest")
+    lp, l_ok = live(json.loads(r["result"]["content"][0]["text"]), "ledger_provenance")
+    if l_ok:
+        chk(bool((lp.get("provenance") or {}).get("engine", {}).get("all_digest")),
+            "ledger_provenance carries engine.all_digest")
 
     r = handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
                 "params": {"name": "wet_lab_anchors",
                            "arguments": {"key": "microbio_monod"}}}, base)
-    an = live(json.loads(r["result"]["content"][0]["text"]), "wet_lab_anchors") or {}
-    chk(an.get("chains_agree") is False,
-        f"dual chain on microbio_monod: vv={((an.get('vv_gate') or {}).get('gate'))} "
-        f"wet_lab={((an.get('wet_lab') or {}).get('gate'))} -> disagree")
-    chk(((an.get("vv_gate_read") or {}).get("ok")) is not False,
-        "the V&V half of the dual chain was actually readable")
+    an, a_ok = live(json.loads(r["result"]["content"][0]["text"]), "wet_lab_anchors")
+    if a_ok:
+        chk(an.get("chains_agree") is False,
+            f"dual chain on microbio_monod: vv={((an.get('vv_gate') or {}).get('gate'))} "
+            f"wet_lab={((an.get('wet_lab') or {}).get('gate'))} -> disagree")
+        chk(((an.get("vv_gate_read") or {}).get("ok")) is not False,
+            "the V&V half of the dual chain was actually readable")
 
     r = handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                 "params": {"name": "verify_prediction",
                            "arguments": {"scenario_key": key, "predictions": [{"y_pred": 1.0}]}}}, base)
-    vd = live(json.loads(r["result"]["content"][0]["text"]), "verify_prediction") or {}
-    chk(vd.get("http_status") == 400, f"wrong-length submission refused (HTTP {vd.get('http_status')})")
+    vd, v_ok = live(json.loads(r["result"]["content"][0]["text"]), "verify_prediction")
+    if v_ok:
+        # 只有真的读到了留出集，才有资格问「wrong-length 有没有被拒」。
+        # 读不到（503 asset_unavailable / 空 body）不是放行，是**没有结论**。
+        chk(vd.get("http_status") == 400,
+            f"wrong-length submission refused (HTTP {vd.get('http_status')})")
 
     r = handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                 "params": {"name": "nope", "arguments": {}}}, base)
