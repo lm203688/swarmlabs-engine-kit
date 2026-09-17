@@ -197,7 +197,22 @@ an *allowed* UA gets 403'd some of the time. Measured on GitHub Actions — CI r
 had changed), had its two **live** jobs (`vv-gate-selftest`,
 `vv-gate-server-selftest`) go red in the same minute, while the two **offline**
 jobs (`lint-and-syntax`, `no-dependencies-in-gate`) stayed green both times. A
-local loop of the same test passed three times in a row. So:
+local loop of the same test passed three times in a row.
+
+> **Correction (0.2.2, same day).** The paragraph above correctly establishes that
+> the block is non-deterministic, but it was **over-applied**: the red live jobs
+> were read as "1010 flakiness" when the dominant cause was a **partially landed
+> deployment** on the host project. Ten consecutive deploys, each reporting
+> `Uploaded 374 files`, produced **4 complete and 6 incomplete** deployments — one
+> served 62 of 379 assets correctly. Pages answers a path that did not land with
+> the SPA's `index.html` at status **200** `text/html`, so the incomplete deploy
+> was invisible to any status-code check, and a 7-day-TTL edge cache entry holding
+> a good copy made it look like ~15% flakiness rather than 100% breakage. Fix the
+> deployment (byte-for-byte post-deploy gate) and the rate drops from 14.7% to
+> **0.7%**. The lesson generalises past this kit: *a non-deterministic upstream
+> error is a hypothesis, not a diagnosis — and "the thing I could not read" is not
+> the same as "the thing that is broken".*
+ So:
 
 * one 1010 is **not** evidence that the service is down, and **not** evidence
   that your client is misconfigured;
