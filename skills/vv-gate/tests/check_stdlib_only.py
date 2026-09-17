@@ -29,10 +29,11 @@ import sys
 ALLOWED = {
     "__future__",
     "argparse", "ast", "collections", "contextlib", "copy", "dataclasses",
-    "datetime", "enum", "functools", "hashlib", "importlib", "io", "itertools",
-    "json", "logging", "math", "operator", "os", "pathlib", "random", "re",
-    "shlex", "statistics", "subprocess", "sys", "tempfile", "textwrap", "time",
-    "traceback", "typing", "unittest", "urllib",
+    "datetime", "enum", "functools", "hashlib", "http", "importlib", "io",
+    "itertools", "json", "logging", "math", "operator", "os", "pathlib",
+    "random", "re", "shlex", "socket", "statistics", "subprocess", "sys",
+    "tempfile", "textwrap", "threading", "time", "traceback", "typing",
+    "unittest", "urllib",
 }
 
 HERE = pathlib.Path(__file__).resolve()
