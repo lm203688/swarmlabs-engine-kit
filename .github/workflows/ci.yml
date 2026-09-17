@@ -29,7 +29,12 @@ jobs:
           python-version: '3.8'   # floor declared in pyproject.toml
 
       - name: Compile all Python
-        run: python -m compileall -q src mcp skills examples
+        run: python -m compileall -q src skills examples mcp_server.py
+
+      - name: MCP server and quickstart run from a fresh clone (no install)
+        run: |
+          python mcp_server.py --help > /dev/null
+          python -c "import ast; ast.parse(open('examples/quickstart.py').read())"
 
       - name: JSON assets parse
         # 一行式，避免 YAML block scalar 的缩进被原样喂给 python 引发的
