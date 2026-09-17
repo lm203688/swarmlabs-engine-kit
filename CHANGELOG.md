@@ -22,13 +22,22 @@ and tags are immutable.
     fail-closed, `ERROR` has no permissive exit code, `gate_policy` is
     published, the ledger is provenance-annotated, an unfilled submission is
     refused, and the oracle round-trips to `r2 == 1`.
+  - `tests/check_stdlib_only.py` — CI guard for the stdlib-only invariant.
+    Mechanical on purpose: a third-party import would not show up in the live
+    smoke test on a machine that happens to have the dependency.
+- `.github/workflows/ci.yml` — syntax + JSON parse, the stdlib-only invariant,
+  and the live smoke test against the deployed service. Unguarded steps: a
+  non-zero exit fails the job. The live job going red when the service is down
+  is intended — a gate you cannot reach is a gate you do not have.
 - `GOVERNANCE.md` — including an explicit statement of bus factor = 1 and a
   continuity plan describing what remains usable if the hosted service stops.
 - `SECURITY.md` — private reporting, scope, the specific class of risk that
   matters here (any input that downgrades a gate decision), and the continuity
   plan restated for the security reader.
-- `CONTRIBUTING.md`, `.github/CODEOWNERS`, issue and PR templates,
-  `CITATION.cff`.
+- `CONTRIBUTING.md`, `CHANGELOG.md`, `CITATION.cff`, `.github/CODEOWNERS`,
+  `.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/*`. CODEOWNERS
+  records the two hard invariants (stdlib-only; fail-closed semantics) next to
+  the files they constrain, so review sees them in context.
 
 ### Changed
 
