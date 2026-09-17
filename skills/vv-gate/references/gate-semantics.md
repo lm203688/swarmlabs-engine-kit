@@ -72,6 +72,10 @@ The last row is the load-bearing one. `ERROR` blocks. Any adjudicator that maps
 "could not evaluate" to "proceed" is not a gate; it is a rubber stamp with a
 logging statement attached.
 
+Exit `4` sits outside this table on purpose: it means **no verdict was
+produced** (edge block or network failure). It is not a weaker `PROCEED` and it
+is not a `BLOCK`. Alert/retry on it; never treat it as clearance.
+
 Coverage is only computed when you supply `y_std`. `coverage = null` in a
 response means *not evaluated*, which is **not** the same as coverage = 1.
 Do not report a `PASS` without `y_std` as "well calibrated".
@@ -183,8 +187,23 @@ stdlib `urllib.request.urlopen(url)` with no `Request` object. If you
 re-implement the client, set a UA. This is the single most likely reason your
 integration "doesn't work" while `curl` works fine.
 
-`vv_gate.py` sends `SwarmLabs-VVGate/1.0 (+https://swarmlabs.tools)` and, on a
-403 containing `1010`, prints an explicit hint instead of a bare traceback.
+`vv_gate.py` sends `SwarmLabs-VVGate/1.0 (+https://swarmlabs.tools)`. On a 403
+containing `1010` it retries and, if every attempt is blocked, prints an explicit
+diagnosis and exits `4` — never a bare traceback, and never a verdict.
+
+**The block is not deterministic.** This matters more than the table above: even
+an *allowed* UA gets 403'd some of the time. Measured on GitHub Actions — CI run
+`#23` ran four jobs, all green. Run `#24`, byte-identical `vv_gate.py` (only docs
+had changed), had its two **live** jobs (`vv-gate-selftest`,
+`vv-gate-server-selftest`) go red in the same minute, while the two **offline**
+jobs (`lint-and-syntax`, `no-dependencies-in-gate`) stayed green both times. A
+local loop of the same test passed three times in a row. So:
+
+* one 1010 is **not** evidence that the service is down, and **not** evidence
+  that your client is misconfigured;
+* treat it as a transient infrastructure signal — retry, then alert;
+* do not "fix" it by caching the last known verdict, and do not convert it to
+  success. Both turn a gate into decoration.
 
 ### 6.2 Input validation on `/v3/verify`
 
@@ -207,25 +226,45 @@ to refuse. Use `template` to obtain a correct `x` skeleton and only fill
 
 ### 6.2b Transient failures retry; verdicts do not
 
-`vv_gate.py` retries `429 / 500 / 502 / 503 / 504` and network errors with
-backoff (max 4 attempts, honouring `Retry-After`). It returns `400 / 404 / 405`
-**immediately**.
+`vv_gate.py` retries `429 / 500 / 502 / 503 / 504`, network errors, **and
+`403 + error code 1010`**, with backoff (max 4 attempts, honouring
+`Retry-After`). It returns `400 / 404 / 405` **immediately**, and a `403` that
+does *not* carry `1010` is returned immediately too — that one is a real edge
+policy rejection, not a coin flip.
 
 That distinction is deliberate and is the difference between a useful CI gate
 and a nuisance: a 400 is a verdict about your input (retrying it is pointless),
 while a 429 is the service telling you to come back. A gate that goes red on a
 transient rate limit teaches people to ignore red — which is worse than not
-testing. `selftest` prints the retry count so you can see when this is
+testing. `selftest` prints the transport counters so you can see when this is
 happening:
 
 ```
-[5] transport: 0 transient retry(ies), last_status=None
+[5] transport: 0 transient retry(ies), 0 edge block(s), last_status=None
 ```
 
 If you re-implement the client, copy this behaviour. Note that `503` is
 ambiguous: it is also the correct response for `policy_unavailable`, and in that
 case retrying will not help. Four attempts costs a few seconds, so the retry is
 kept for both.
+
+The retry path is covered by a **deterministic** regression test, not just a
+pure-function assertion: `tests/run_selftest.py` group `[J]` stands up a local
+HTTP server that always answers `403 error code: 1010` and asserts that the
+client retried exactly `MAX_ATTEMPTS` times and exited `4`; it then switches the
+fake to a plain `403` and asserts a **single** attempt. The second half is the
+control case — without it, "we retry 1010" and "we retry every 403" would look
+identical in the logs.
+
+```
+[J] the exact CI failure, reproduced deterministically (local fake edge)
+  ok   403/1010 -> exit 4 (expected 4)
+  ok   retried 4x (expected 4) — the block is probabilistic
+  ok   stderr names the actual edge code (not a bare traceback)
+  ok   stderr states that no verdict was produced
+  ok   a plain 403 is NOT retried (1 hit(s)) — control case
+  ok   a plain 403 is not misreported as BLOCK (exit 1)
+```
 
 ### 6.3 Endpoint map
 
