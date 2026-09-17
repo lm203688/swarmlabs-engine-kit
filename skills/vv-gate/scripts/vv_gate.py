@@ -22,6 +22,12 @@
 * ``check`` —— **静态**：这个场景现在的可信状态是什么？（读已发布的门禁账本）
 * ``verify`` —— **动态**：**你自己的预测**在这批公开留出点上对不对？（我们持有真值）
 
+瞬时故障会重试，判定失败不会
+----------------------------
+``429/500/502/503/504`` 与网络错误会退避重试（最多 4 次，尊重 ``Retry-After``）。
+``400/404/405`` 一律**立即返回**——它们是对你输入的判定，不是「稍后再试」。
+这条区分是刻意的：CI 里一次限流导致的红灯会教人忽略红灯，比不测更糟。
+
 用法
 ----
     python vv_gate.py scenarios
@@ -43,6 +49,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,36 +61,103 @@ DEFAULT_BASE = os.environ.get("SWARMLABS_BASE", "https://swarmlabs.tools").rstri
 #: 这是实测结果，不是猜测——见 references/gate-semantics.md 的「消费者注意事项」。
 USER_AGENT = "SwarmLabs-VVGate/1.0 (+https://swarmlabs.tools)"
 
+#: 瞬时状态码。**必须与「判定失败」区分开**：CI 里一次限流导致的红灯会教人
+#: 忽略红灯，那比不测更糟。这些码重试，其他码（400/404/405/503-policy）立即返回。
+TRANSIENT_STATUS = (429, 500, 502, 503, 504)
+MAX_ATTEMPTS = 4
+BACKOFF_S = (1.5, 4.0, 9.0)
+
 GATE_PROCEED = "PROCEED"
 GATE_HUMAN = "PROCEED_WITH_HUMAN_CHECK"
 GATE_BLOCK = "BLOCK_AUTONOMOUS_ACTION"
 GATE_EXIT = {GATE_PROCEED: 0, GATE_HUMAN: 3, GATE_BLOCK: 2}
 
+_LAST_TRANSPORT = {"retries": 0, "last_status": None}
+
+
+def _sleep(i: int, retry_after=None) -> None:
+    delay = BACKOFF_S[min(i, len(BACKOFF_S) - 1)]
+    if retry_after:
+        try:
+            delay = max(delay, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    time.sleep(delay)
+
 
 # ---------------------------------------------------------------- transport
 def _get(base: str, path: str, timeout: float = 30.0):
-    req = urllib.request.Request(base + path, method="GET",
-                                 headers={"User-Agent": USER_AGENT,
-                                          "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    """GET with retries on transient failures only.
+
+    Returns parsed JSON. Raises HTTPError for non-transient statuses so the
+    caller sees the real status (404 means "no such key", not "try again").
+    """
+    last = None
+    for i in range(MAX_ATTEMPTS):
+        req = urllib.request.Request(base + path, method="GET",
+                                     headers={"User-Agent": USER_AGENT,
+                                              "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code not in TRANSIENT_STATUS:
+                raise
+            _LAST_TRANSPORT["last_status"] = e.code
+            _LAST_TRANSPORT["retries"] = i
+            last = e
+            if i < MAX_ATTEMPTS - 1:
+                _sleep(i, e.headers.get("Retry-After") if e.headers else None)
+        except urllib.error.URLError as e:
+            _LAST_TRANSPORT["last_status"] = "URLError"
+            _LAST_TRANSPORT["retries"] = i
+            last = e
+            if i < MAX_ATTEMPTS - 1:
+                _sleep(i)
+    raise last
 
 
 def _post(base: str, path: str, payload: dict, timeout: float = 90.0):
+    """POST. Returns (status, body).
+
+    Retries only on transient statuses and network errors. A 400 is a verdict
+    about your input and must be returned immediately - retrying a malformed
+    submission would be both pointless and misleading.
+    """
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        base + path, data=data, method="POST",
-        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json",
-                 "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+    last = None
+    for i in range(MAX_ATTEMPTS):
+        req = urllib.request.Request(
+            base + path, data=data, method="POST",
+            headers={"User-Agent": USER_AGENT, "Content-Type": "application/json",
+                     "Accept": "application/json"})
         try:
-            return e.code, json.loads(raw)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            if e.code not in TRANSIENT_STATUS:
+                try:
+                    return e.code, json.loads(raw)
+                except Exception:
+                    return e.code, {"error": "non_json_response", "raw": raw[:400]}
+            _LAST_TRANSPORT["last_status"] = e.code
+            _LAST_TRANSPORT["retries"] = i
+            last = (e.code, raw)
+            if i < MAX_ATTEMPTS - 1:
+                _sleep(i, e.headers.get("Retry-After") if e.headers else None)
+        except urllib.error.URLError as e:
+            _LAST_TRANSPORT["last_status"] = "URLError"
+            _LAST_TRANSPORT["retries"] = i
+            last = e
+            if i < MAX_ATTEMPTS - 1:
+                _sleep(i)
+    if isinstance(last, tuple):
+        try:
+            return last[0], json.loads(last[1])
         except Exception:
-            return e.code, {"error": "non_json_response", "raw": raw[:400]}
+            return last[0], {"error": "non_json_response", "raw": last[1][:400]}
+    raise last
 
 
 # ---------------------------------------------------------------- commands
@@ -204,6 +278,8 @@ def cmd_selftest(args) -> int:
         an = _get(args.base, "/v3/anchors")
         n = len(an.get("anchors") or an.get("scenarios") or an.get("entries") or [])
         print(f"[4] anchors: {n} entries")
+    r = _LAST_TRANSPORT["retries"]
+    print(f"[5] transport: {r} transient retry(ies), last_status={_LAST_TRANSPORT['last_status']}")
     print("SELFTEST " + ("OK" if ok else "FAILED"))
     return 0 if ok else 1
 
