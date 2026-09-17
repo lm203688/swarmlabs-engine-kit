@@ -12,10 +12,15 @@
     0  gate = PROCEED                    可以继续
     2  gate = BLOCK_AUTONOMOUS_ACTION    禁止自主动作（应作为 CI 硬闸门）
     3  gate = PROCEED_WITH_HUMAN_CHECK   需要人工签字
-    1  调用/参数错误
+    4  无法到达裁决者（边缘拦截 / 网络失败）——**没有裁决**，不是「裁决说 no」
+    1  调用/参数错误（本地：文件不存在、预测为空、响应非 JSON）
 
 把它放进流水线，`python vv_gate.py check <key>` 返回 2 就会让流水线红掉——
 这是"可验证性"落到工程里的样子，而不是文档里的形容词。
+
+`2` 与 `4` 分开是刻意的。一个闸门如果连不上就等于不存在；但把「连不上」和
+「判定为阻塞」混成同一个退出码，运维就分不清「该修网络」还是「该停下来」。
+CI 里前者应该重试并告警，后者必须硬停。
 
 覆盖的两个问题不一样，不要混
 ----------------------------
@@ -24,9 +29,15 @@
 
 瞬时故障会重试，判定失败不会
 ----------------------------
-``429/500/502/503/504`` 与网络错误会退避重试（最多 4 次，尊重 ``Retry-After``）。
-``400/404/405`` 一律**立即返回**——它们是对你输入的判定，不是「稍后再试」。
+``429/500/502/503/504``、网络错误、以及 ``403 + error code 1010`` 会退避重试
+（最多 4 次，尊重 ``Retry-After``）。``400/404/405`` 一律**立即返回**——它们是对你
+输入的判定，不是「稍后再试」。
 这条区分是刻意的：CI 里一次限流导致的红灯会教人忽略红灯，比不测更糟。
+
+1010 为什么也要重试：它是 Cloudflare 的 Browser-Integrity 拒绝，实测**非确定性**——
+同一个显式 UA 时通时不通（GitHub Actions 上两个实时 job 在同一分钟、跑完全相同的
+代码，一个全绿一个全红，而两个纯离线的 job 两次都绿）。概率性拦截重试常能过；
+真过不去则抛 ``EdgeBlocked``，打印带 UA 的明确提示并返回 **4**，绝不伪装成裁决。
 
 用法
 ----
@@ -64,6 +75,11 @@ USER_AGENT = "SwarmLabs-VVGate/1.0 (+https://swarmlabs.tools)"
 #: 瞬时状态码。**必须与「判定失败」区分开**：CI 里一次限流导致的红灯会教人
 #: 忽略红灯，那比不测更糟。这些码重试，其他码（400/404/405/503-policy）立即返回。
 TRANSIENT_STATUS = (429, 500, 502, 503, 504)
+#: Cloudflare 的 Browser-Integrity 拒绝用 `403 error code: 1010`。
+#: 实测**非确定性**：同一个显式 UA 时通时不通（GitHub Actions 上两个 job 同一分钟
+#: 一个全绿一个全红，代码完全相同）。所以 1010 也重试——它可能是概率性拦截，
+#: 重试常能过；真过不去则抛带 UA 的明确错误，而不是一个裸 traceback。
+BLOCKED_EDGE_CODE = "1010"
 MAX_ATTEMPTS = 4
 BACKOFF_S = (1.5, 4.0, 9.0)
 
@@ -72,7 +88,22 @@ GATE_HUMAN = "PROCEED_WITH_HUMAN_CHECK"
 GATE_BLOCK = "BLOCK_AUTONOMOUS_ACTION"
 GATE_EXIT = {GATE_PROCEED: 0, GATE_HUMAN: 3, GATE_BLOCK: 2}
 
-_LAST_TRANSPORT = {"retries": 0, "last_status": None}
+#: 与 `1`（本地用法错误）分开。见文件头「为什么是一个可执行脚本」。
+EXIT_UNREACHABLE = 4
+
+_LAST_TRANSPORT = {"retries": 0, "last_status": None, "edge_blocks": 0}
+
+
+class EdgeBlocked(RuntimeError):
+    """Cloudflare rejected the request (403/1010) even after retries.
+
+    Distinct from "the adjudicator said no": this means we never reached it.
+    Exposed as its own type so callers (and CI logs) can tell the two apart.
+    """
+
+
+def _is_edge_block(status, raw) -> bool:
+    return status == 403 and BLOCKED_EDGE_CODE in (raw or "")
 
 
 def _sleep(i: int, retry_after=None) -> None:
@@ -101,11 +132,18 @@ def _get(base: str, path: str, timeout: float = 30.0):
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            if e.code not in TRANSIENT_STATUS:
+            raw = e.read().decode("utf-8", "replace") if e.fp else ""
+            edge = _is_edge_block(e.code, raw)
+            if e.code not in TRANSIENT_STATUS and not edge:
                 raise
+            if edge:
+                _LAST_TRANSPORT["edge_blocks"] += 1
             _LAST_TRANSPORT["last_status"] = e.code
             _LAST_TRANSPORT["retries"] = i
-            last = e
+            last = EdgeBlocked(
+                f"Cloudflare rejected {USER_AGENT!r} with 403 error code 1010 "
+                f"after {MAX_ATTEMPTS} attempts on GET {path}. This is an edge "
+                f"block, not a verdict - we never reached the adjudicator.") if edge else e
             if i < MAX_ATTEMPTS - 1:
                 _sleep(i, e.headers.get("Retry-After") if e.headers else None)
         except urllib.error.URLError as e:
@@ -120,9 +158,9 @@ def _get(base: str, path: str, timeout: float = 30.0):
 def _post(base: str, path: str, payload: dict, timeout: float = 90.0):
     """POST. Returns (status, body).
 
-    Retries only on transient statuses and network errors. A 400 is a verdict
-    about your input and must be returned immediately - retrying a malformed
-    submission would be both pointless and misleading.
+    Retries only on transient statuses, network errors and edge blocks (403/1010).
+    A 400 is a verdict about your input and must be returned immediately -
+    retrying a malformed submission would be both pointless and misleading.
     """
     data = json.dumps(payload).encode("utf-8")
     last = None
@@ -136,14 +174,21 @@ def _post(base: str, path: str, payload: dict, timeout: float = 90.0):
                 return r.status, json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
-            if e.code not in TRANSIENT_STATUS:
+            edge = _is_edge_block(e.code, raw)
+            if e.code not in TRANSIENT_STATUS and not edge:
                 try:
                     return e.code, json.loads(raw)
                 except Exception:
                     return e.code, {"error": "non_json_response", "raw": raw[:400]}
+            if edge:
+                _LAST_TRANSPORT["edge_blocks"] += 1
             _LAST_TRANSPORT["last_status"] = e.code
             _LAST_TRANSPORT["retries"] = i
-            last = (e.code, raw)
+            last = EdgeBlocked(
+                f"Cloudflare rejected {USER_AGENT!r} with 403 error code 1010 "
+                f"after {MAX_ATTEMPTS} attempts on POST {path}. This is an edge "
+                f"block, not a verdict - we never reached the adjudicator.") if edge \
+                else (e.code, raw)
             if i < MAX_ATTEMPTS - 1:
                 _sleep(i, e.headers.get("Retry-After") if e.headers else None)
         except urllib.error.URLError as e:
@@ -279,7 +324,9 @@ def cmd_selftest(args) -> int:
         n = len(an.get("anchors") or an.get("scenarios") or an.get("entries") or [])
         print(f"[4] anchors: {n} entries")
     r = _LAST_TRANSPORT["retries"]
-    print(f"[5] transport: {r} transient retry(ies), last_status={_LAST_TRANSPORT['last_status']}")
+    eb = _LAST_TRANSPORT["edge_blocks"]
+    print(f"[5] transport: {r} transient retry(ies), {eb} edge block(s), "
+          f"last_status={_LAST_TRANSPORT['last_status']}")
     print("SELFTEST " + ("OK" if ok else "FAILED"))
     return 0 if ok else 1
 
@@ -323,16 +370,29 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     try:
         return args.fn(args)
+    except EdgeBlocked as e:
+        # 我们**没有**拿到裁决。返回 4 而不是 2/3 —— 不能把「够不到」说成「判定为否」。
+        print(f"UNREACHABLE (edge block): {e}", file=sys.stderr)
+        print(f"hint: Cloudflare answered 403 for our explicit User-Agent "
+              f"{USER_AGENT!r} on all {MAX_ATTEMPTS} attempts. Different UAs behave "
+              f"differently and the block is not deterministic; if this is CI, treat "
+              f"it as infrastructure failure (retry/alert), not as a gate verdict.",
+              file=sys.stderr)
+        return EXIT_UNREACHABLE
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")[:300]
         print(f"HTTP {e.code}: {raw}", file=sys.stderr)
-        if e.code == 403 and "1010" in raw:
-            print("hint: Cloudflare rejected this User-Agent. Set an explicit UA "
-                  "(empty UA and Python-urllib/... are blocked).", file=sys.stderr)
+        if _is_edge_block(e.code, raw):
+            print(f"hint: Cloudflare edge block (403/1010) for {USER_AGENT!r}. "
+                  "This is an edge policy rejection — no verdict was produced.",
+                  file=sys.stderr)
+            return EXIT_UNREACHABLE
         return 1
     except urllib.error.URLError as e:
         print(f"network error: {e.reason}", file=sys.stderr)
-        return 1
+        print("hint: no verdict was produced — this is unreachability, not a gate 'no'.",
+              file=sys.stderr)
+        return EXIT_UNREACHABLE
     except KeyboardInterrupt:
         return 130
 
