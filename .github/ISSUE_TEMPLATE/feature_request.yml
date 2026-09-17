@@ -1,0 +1,42 @@
+name: Feature or integration request
+description: Propose a capability, or report that you are trying to consume the gate and something is missing
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you actually trying to do?
+      description: |
+        Describe the workflow, not the solution. "My harness produces predictions
+        and I want to block the pipeline when they're wrong" is more useful than
+        "add a --fail flag".
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: What do you do today instead?
+      description: The workaround matters — it tells us how urgent this is.
+    validations:
+      required: false
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Invariants you may not break
+      description: Read GOVERNANCE.md §Decision-making before proposing anything that touches the gate.
+      options:
+        - label: I understand `skills/vv-gate/` must stay Python 3.8+ stdlib only, with no third-party imports
+          required: true
+        - label: I understand the verdict→gate mapping is fail-closed and `ERROR` must never map to `PROCEED`
+          required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: |
+        If you are integrating this into an existing harness or evaluator, say
+        which one — the most valuable thing this project can learn is where the
+        gate is being consumed, since that is also where it is most likely to be
+        quietly renamed into something it is not.
+    validations:
+      required: false
