@@ -41,6 +41,16 @@ and tags are immutable.
 
 ### Changed
 
+- **`mcp/server.py` → `mcp_server.py` (breaking for anyone importing it).** The
+  old documented entry point, `python -m mcp.server`, was wrong: `mcp` is also
+  the name of the real Model Context Protocol SDK on PyPI, so that command
+  imports **that** package instead of this file and fails with an unrelated
+  traceback from `anyio`. Keeping the server at top level as `mcp_server.py`
+  removes the collision. Start it with `python mcp_server.py --base-url ...`.
+- `mcp_server.py` and `examples/quickstart.py` now run from a fresh clone
+  **without** `pip install -e .`, by falling back to the in-repo `src/` layout.
+  Previously both died on import, which made "clone and try it" look broken.
+- CI additionally asserts that `mcp_server.py --help` works without an install.
 - `README.md` — the V&V gate is now the headline capability rather than a
   footnote, with the "reproducible ≠ valid" framing and a consumer warning
   about the Cloudflare `1010` User-Agent behaviour.
