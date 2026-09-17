@@ -43,7 +43,7 @@ to your agent's claim, and block it. See
 | Path | What |
 |---|---|
 | `src/swarmlabs_engine/` | Python client SDK (`SwarmLabsClient`) |
-| `mcp/server.py` | Reference MCP server exposing engine calls as tools |
+| `mcp_server.py` | Reference MCP server exposing engine calls as tools |
 | `skills/vv-gate/` | **Independent V&V gate** — zero-dep client + SKILL.md + semantics reference |
 | `skills/skill_catalog.json` | Machine-readable catalog of the core Skills |
 | `examples/quickstart.py` | Minimal end-to-end example |
@@ -147,11 +147,20 @@ MCP-aware agent (Claude Desktop, Cursor, custom runtimes) can use SwarmLabs as
 a trusted scientific-compute tool:
 
 ```bash
-python -m mcp.server --base-url https://your-swarmlabs-engine.example.com
+python mcp_server.py --base-url https://your-swarmlabs-engine.example.com
 ```
 
 It exposes `swarmlabs_run`, `swarmlabs_list`, and `swarmlabs_sweep` tools with
 explicit input schemas and the same honesty-first result contract.
+
+> **Why the file is at top level, not `mcp/server.py`.** It used to be the
+> latter, documented as `python -m mcp.server`. That fails confusingly: `mcp` is
+> also the name of the real Model Context Protocol SDK on PyPI, so
+> `python -m mcp.server` imports **that** package instead of this file. Naming
+> the module `mcp_server.py` removes the collision.
+
+Both `mcp_server.py` and `examples/quickstart.py` run from a fresh clone
+**without** `pip install`, by falling back to the in-repo `src/` layout.
 
 ## Skill catalog
 
