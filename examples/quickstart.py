@@ -2,9 +2,23 @@
 
 Replace BASE_URL with your deployed SwarmLabs engine endpoint. Works against
 any deployment exposing the /api/v2/ surface.
+
+Runs from a fresh clone with no install: if `swarmlabs_engine` is not already
+importable (i.e. `pip install -e .` was not run), the in-repo `src/` layout is
+added to sys.path below. Otherwise this file dies on line 1 of the import and
+makes "clone and try it" look broken.
 """
 
-from swarmlabs_engine import SwarmLabsClient
+import os
+import sys
+
+try:  # installed package
+    from swarmlabs_engine import SwarmLabsClient
+except ModuleNotFoundError:  # fresh clone: use the in-repo src/ layout
+    _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    if os.path.isdir(_SRC) and _SRC not in sys.path:
+        sys.path.insert(0, _SRC)
+    from swarmlabs_engine import SwarmLabsClient
 
 
 BASE_URL = "https://your-swarmlabs-engine.example.com"
