@@ -4,6 +4,65 @@ All notable changes to this kit. Versions follow the `pyproject.toml` version
 field; there are no maintained release branches — `main` is the supported line,
 and tags are immutable.
 
+## [0.2.1] — 2026-09-17
+
+### Fixed
+
+- **A Cloudflare `403 error code 1010` could make the gate intermittently
+  unavailable on both channels, and there was no way to tell that apart from a
+  verdict.** The block is **not deterministic**: CI run `#23` ran four jobs all
+  green; run `#24`, with a byte-identical `vv_gate.py` (only docs had changed),
+  had its two *live* jobs (`vv-gate-selftest`, `vv-gate-server-selftest`) go red
+  in the same minute, while the two *offline* jobs stayed green both times. A
+  local loop of the same test passed three times in a row.
+
+  The failure mode mattered more than the flake: a client that cannot reach the
+  adjudicator has **no verdict**, yet the old code returned the same `1` it uses
+  for "you passed a bad file", and the MCP server returned `gate_unavailable`
+  for both a real 404 and an edge block.
+
+  - `scripts/vv_gate.py` now retries `403/1010` alongside `429/5xx` and network
+    errors, and on a persistent block raises a distinct `EdgeBlocked` that maps
+    to a **new exit code `4` — "unreachable"**, never `2` (BLOCK) and never `0`.
+    A plain `403` that does *not* carry `1010` is still returned immediately: it
+    is a real rejection, not a coin flip.
+  - `vv_gate_server.py` gets the same transport contract and now labels
+    unreachability explicitly (`unreachable: true`, `retryable: true`,
+    `exit_code: 4`, plus a note) instead of collapsing it into
+    `*_unavailable`. No `gate` field is invented, so a model reading the result
+    cannot mistake "we never asked" for an implicit pass.
+  - `TRANSIENT_STATUS` is deliberately *not* widened to include `403`; the retry
+    is keyed on the `1010` body, so a blanket 403 stays fatal.
+
+### Added
+
+- **Deterministic regression tests for the above**, in both channels, because a
+  pure-function assertion would not have caught the original bug:
+  - `tests/run_selftest.py` group `[J]` stands up a local HTTP server that always
+    answers `403 error code: 1010` and asserts the client retried exactly
+    `MAX_ATTEMPTS` times and exited `4`; it then flips the fake to a plain `403`
+    and asserts a **single** attempt. That second half is the control case —
+    without it, "we retry 1010" and "we retry every 403" look identical in logs.
+  - `vv_gate_server.py --selftest` runs the same experiment against
+    `gate_decision` and additionally checks a dead base
+    (`127.0.0.1:59999`) reports `exit_code: 4` with no invented `gate`.
+  - `tests/run_selftest.py` group `[I]` asserts an unreachable base exits `4`
+    and never `0/2/3`.
+  - `tests/check_stdlib_only.py` allow-list gains `http`, `socket`, `threading`
+    (all stdlib — the invariant is unchanged); its scope already covered
+    `vv_gate_server.py`, which is how this was caught.
+- Group `[H]` now guards the scenario-level `/v3/anchors/{scenario_key}`
+  regression: that endpoint used to 404 on **every** key because the Worker
+  indexed a JSON *array* with a string key. It now asserts both evidence chains
+  come back.
+
+### Changed
+
+- `USER_AGENT`-related consumer guidance is now "the block is probabilistic"
+  rather than "set a UA and you are fine" — in `SKILL.md` and in
+  `references/gate-semantics.md` §6.1/§6.2b, with the CI evidence recorded.
+- `vv_gate_server.py` `SERVER_VERSION` → `1.1.0`.
+
 ## [0.2.0] — 2026-09-17
 
 ### Added
