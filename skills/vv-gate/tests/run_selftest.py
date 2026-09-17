@@ -14,12 +14,15 @@ Exits 0 on success, 1 on any assertion failure.
 
 from __future__ import annotations
 
+import http.server
 import importlib.util
 import io
 import json
 import os
 import sys
-from contextlib import redirect_stdout
+import threading
+import urllib.parse
+from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, os.pardir, "scripts", "vv_gate.py")
@@ -61,6 +64,24 @@ def main() -> int:
     check(mod.GATE_EXIT.get("BLOCK_AUTONOMOUS_ACTION") == 2, "BLOCK -> 2")
     check(mod.GATE_EXIT.get("PROCEED_WITH_HUMAN_CHECK") == 3, "HUMAN_CHECK -> 3")
     check("ERROR" not in mod.GATE_EXIT, "ERROR has no permissive exit code (must fall through to 1)")
+    check(mod.EXIT_UNREACHABLE == 4, f"unreachable -> 4 (got {mod.EXIT_UNREACHABLE})")
+    check(2 not in (mod.EXIT_UNREACHABLE,), "unreachable must NOT reuse the BLOCK code 2")
+
+    print("[B2] edge-block classifier is a pure function (no network)")
+    ib = mod._is_edge_block
+    check(ib(403, '{"error code":1010}') is True, "403 + 1010 -> edge block")
+    check(ib(403, "error code: 1010") is True, "403 + 'error code: 1010' -> edge block")
+    check(ib(403, "Forbidden") is False, "403 without 1010 -> not an edge block (real verdict)")
+    check(ib(404, "1010") is False, "404 carrying '1010' is still a 404, not an edge block")
+    check(ib(200, "1010") is False, "a 200 can never be an edge block")
+    check(403 not in mod.TRANSIENT_STATUS,
+          "403 is not blanket-retried — only the 1010 variant is")
+    check(mod.BLOCKED_EDGE_CODE == "1010", f"edge code = {mod.BLOCKED_EDGE_CODE!r}")
+    check(mod.MAX_ATTEMPTS >= 2, f"MAX_ATTEMPTS = {mod.MAX_ATTEMPTS} (retry must actually happen)")
+    check(429 in mod.TRANSIENT_STATUS and 503 in mod.TRANSIENT_STATUS,
+          f"true transient statuses still retried: {mod.TRANSIENT_STATUS}")
+    check(400 not in mod.TRANSIENT_STATUS and 404 not in mod.TRANSIENT_STATUS,
+          "verdict statuses (400/404) are never retried")
 
     print("[C] live selftest")
     buf = io.StringIO()
@@ -120,6 +141,86 @@ def main() -> int:
     check(one.get("key") == lit, f"literature anchor {lit} resolves")
     sc_keys = [s.get("scenario_key") for s in (anchors.get("scenarios") or [])]
     check(bool(sc_keys), f"scenario-level dual chains present: {sc_keys[:3]}…")
+    # Regression guard: the scenario-level endpoint used to 404 on every key,
+    # because `scenarios` is a LIST and the worker indexed it with [key].
+    if sc_keys:
+        sk = sc_keys[0]
+        sc = mod._get(BASE, f"/v3/anchors/{urllib.parse.quote(sk)}")
+        check(sc.get("scenario_key") == sk, f"scenario anchor {sk} resolves (was 404)")
+        check(bool(sc.get("wet_lab")), "scenario anchor carries the wet-lab chain")
+        check(bool(sc.get("vv_gate")), "scenario anchor carries the V&V chain (dual display)")
+
+    print("[I] an unreachable adjudicator returns 4 — never 2/3, and never a fake verdict")
+    saved_attempts, saved_backoff = mod.MAX_ATTEMPTS, mod.BACKOFF_S
+    mod.MAX_ATTEMPTS, mod.BACKOFF_S = 1, (0.0,)  # keep the test instant
+    buf2 = io.StringIO()
+    try:
+        with redirect_stdout(buf2), redirect_stderr(buf2):
+            rc_bad = mod.main(["--base", "http://127.0.0.1:59999", "check", "microbio_monod"])
+    finally:
+        mod.MAX_ATTEMPTS, mod.BACKOFF_S = saved_attempts, saved_backoff
+    check(rc_bad == 4, f"exit code = {rc_bad} (expected 4) :: {buf2.getvalue().strip()[:200]}")
+    check(rc_bad not in (0, 2, 3),
+          "an unreachable gate is never reported as PROCEED / BLOCK / HUMAN_CHECK")
+    check("verdict" in buf2.getvalue().lower(),
+          "stderr explains that no verdict was produced")
+
+    print("[J] the exact CI failure, reproduced deterministically (local fake edge)")
+    # CI run #24: two *live* jobs went red in the same minute while two offline jobs
+    # stayed green, on code that had just passed in run #23. Cause: Cloudflare
+    # answers 403 + "error code: 1010" non-deterministically. This drives a real
+    # socket so the retry loop, the EdgeBlocked type and the exit code are all
+    # exercised — a pure-function check would not have caught the original bug.
+    class FakeEdge(http.server.BaseHTTPRequestHandler):
+        mode = "1010"
+        hits = 0
+
+        def _reply(self):
+            type(self).hits += 1
+            body = (b'<html><head><title>Access denied</title></head><body>'
+                    b'<h1>Error 1010</h1>error code: 1010</body></html>'
+                    if type(self).mode == "1010"
+                    else b'{"error": "Forbidden"}')
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _reply
+
+        def log_message(self, *a):  # silence
+            pass
+
+    # MAX_ATTEMPTS stays at its real value so the retry count is meaningful;
+    # only the back-off is zeroed so the test does not sleep for 15s.
+    mod.BACKOFF_S = (0.0, 0.0, 0.0, 0.0)
+    srv = http.server.HTTPServer(("127.0.0.1", 0), FakeEdge)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        FakeEdge.mode, FakeEdge.hits = "1010", 0
+        buf3 = io.StringIO()
+        with redirect_stdout(buf3), redirect_stderr(buf3):
+            rc_edge = mod.main(["--base", f"http://127.0.0.1:{port}", "check", "microbio_monod"])
+        out3 = buf3.getvalue()
+        check(rc_edge == 4, f"403/1010 -> exit {rc_edge} (expected 4)")
+        check(FakeEdge.hits == mod.MAX_ATTEMPTS,
+              f"retried {FakeEdge.hits}x (expected {mod.MAX_ATTEMPTS}) — the block is probabilistic")
+        check("1010" in out3, "stderr names the actual edge code (not a bare traceback)")
+        check("verdict" in out3.lower(), "stderr states that no verdict was produced")
+
+        FakeEdge.mode, FakeEdge.hits = "plain403", 0
+        buf4 = io.StringIO()
+        with redirect_stdout(buf4), redirect_stderr(buf4):
+            rc_403 = mod.main(["--base", f"http://127.0.0.1:{port}", "check", "microbio_monod"])
+        check(FakeEdge.hits == 1,
+              f"a plain 403 is NOT retried ({FakeEdge.hits} hit(s)) — control case")
+        check(rc_403 != 2, f"a plain 403 is not misreported as BLOCK (exit {rc_403})")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        mod.BACKOFF_S = saved_backoff
 
     print()
     if failures:
