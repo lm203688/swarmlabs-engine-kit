@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swarmlabs-engine-kit"
-version = "0.2.1"
+version = "0.2.2"
 description = "Open-source client SDK, MCP server, and agent Skills for the SwarmLabs physics-informed scientific experiment automation engine — including vv-gate, an independent fail-closed verification gate."
 readme = "README.md"
 license = { text = "MIT" }
