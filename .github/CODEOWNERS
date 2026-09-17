@@ -1,0 +1,18 @@
+# CODEOWNERS
+#
+# One maintainer. Review latency is not guaranteed and there is no on-call.
+# See GOVERNANCE.md before depending on anything here for anything important.
+
+*                       @lm203688
+
+# Hard invariants that must not be relaxed in review:
+#
+# skills/vv-gate/ must stay Python 3.8+ stdlib only (no numpy, no requests).
+# The gate's value is that it runs inside someone else's harness with no build
+# step. A PR adding a dependency there is rejected regardless of merit.
+skills/vv-gate/         @lm203688
+
+# Gate semantics are load-bearing: verdict->gate must stay fail-closed, ERROR
+# must never map to PROCEED, and a missing gate_policy must return 503 rather
+# than falling back to a default. Published failures stay published.
+skills/vv-gate/references/gate-semantics.md  @lm203688
