@@ -29,12 +29,28 @@ jobs:
           python-version: '3.8'   # floor declared in pyproject.toml
 
       - name: Compile all Python
-        run: python -m compileall -q src skills examples mcp_server.py
+        run: python -m compileall -q src skills examples mcp_server.py vv_gate_server.py
 
       - name: MCP server and quickstart run from a fresh clone (no install)
         run: |
           python mcp_server.py --help > /dev/null
+          python vv_gate_server.py --help > /dev/null
           python -c "import ast; ast.parse(open('examples/quickstart.py').read())"
+
+  vv-gate-server-selftest:
+    needs: lint-and-syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Assert the stdio MCP server still speaks MCP
+        # Drives a real protocol session: initialize, tools/list, and one live
+        # tools/call against the deployed service. It has no third-party deps,
+        # so there is nothing to install first - which is the point.
+        run: python vv_gate_server.py --selftest
 
       - name: JSON assets parse
         # 一行式，避免 YAML block scalar 的缩进被原样喂给 python 引发的
