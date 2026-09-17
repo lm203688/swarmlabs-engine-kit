@@ -31,52 +31,62 @@ numbers. SwarmLabs takes the opposite stance — **honesty-first**:
 This kit makes those guarantees easy to build on top of, from a Python script,
 an MCP-compatible agent runtime, or a no-code agent builder.
 
+It also ships something most scientific-AI toolkits do not: a **verification
+gate you do not control** — an independent adjudicator that can answer *"no"*
+to your agent's claim, and block it. See
+[`skills/vv-gate/`](skills/vv-gate/SKILL.md).
+
 ## What's inside
 
 | Path | What |
 |---|---|
 | `src/swarmlabs_engine/` | Python client SDK (`SwarmLabsClient`) |
 | `mcp/server.py` | Reference MCP server exposing engine calls as tools |
-| `mcp/vv_gate_server.py` | **Verification-gate MCP server** — ask "can this scenario be trusted right now?" |
-| `skills/skill_catalog.json` | Machine-readable catalog of the 4 core Skills |
+| `skills/vv-gate/` | **Independent V&V gate** — zero-dep client + SKILL.md + semantics reference |
+| `skills/skill_catalog.json` | Machine-readable catalog of the core Skills |
 | `examples/quickstart.py` | Minimal end-to-end example |
 | `docs/API.md` | Endpoint reference |
 
-## The verification gate (why this kit exists in 2026)
+## V&V gate — an adjudicator you don't control
 
-Frontier research agents now *generate* scientific results with no plugins and no
-fine-tuning — GPT-6 Astra topped Insilico Medicine's DDD antibody-developability
-benchmark (37.98) with none of either. Reviews of these agents are unanimous on the
-failure mode: *"prone to plausible-but-wrong outputs, weak guardrails."* The
-prescription is a **held-out benchmark + quantified uncertainty + a human checkpoint**.
+> **Reproducible ≠ valid.** A fully reproducible experiment can be fully wrong.
+> Git already sells reproducibility. What's missing is adjudication.
 
-`mcp/vv_gate_server.py` is a runnable MCP server for that checkpoint. It is
-**HTTP-backed** — no engine, no numpy — and answers from the published,
-machine-readable endpoints:
+`skills/vv-gate/scripts/vv_gate.py` is a single stdlib-only file that answers
+two different questions, and returns a **real exit code** so it can be a CI
+hard gate rather than a dashboard:
 
-| MCP tool | Backed by |
-|---|---|
-| `list_scenarios`, `get_verdict_summary` | `GET https://swarmlabs.tools/v3/report-index` |
-| `gate_for_scenario`, `get_uncertainty_budget` | `GET https://swarmlabs.tools/v3/gate/{key}` |
-| `get_report` | `GET https://swarmlabs.tools/v3/report/{key}` · `/reports/html/{key}.html` |
-
-Every scenario returns a gate decision — `PROCEED`, `PROCEED_WITH_HUMAN_CHECK`, or
-`BLOCK_AUTONOMOUS_ACTION` — plus a first-class uncertainty budget (3% noise floor
-never lowered; calibration κ only widens uncertainty, capped at 40; single-sided
-coverage). **Refuted scenarios stay published:** 5 of 62 are `REFUTED` and blocked,
-because knowing where *not* to trust a surrogate is the product.
+| Question | Command | Where the truth lives |
+|---|---|---|
+| What is the current trust state of scenario X? | `check X` | vendor's published gate ledger |
+| Are **my** predictions on this held-out set correct? | `verify X --pred p.json` | held-out set whose **y we hold**, you don't |
 
 ```bash
-pip install mcp
-python mcp/vv_gate_server.py              # stdio MCP server
-python mcp/vv_gate_server.py --selftest   # smoke test against the live API
+python skills/vv-gate/scripts/vv_gate.py selftest
+python skills/vv-gate/scripts/vv_gate.py scenarios
+python skills/vv-gate/scripts/vv_gate.py template microbio_monod -o preds.json
+#   ... fill preds.json with your y_pred (and optionally y_std = your 1-sigma)
+python skills/vv-gate/scripts/vv_gate.py verify microbio_monod --pred preds.json
+#   exit 0 = PROCEED | 3 = needs human sign-off | 2 = BLOCK the autonomous action
 ```
 
-> **Honest boundary:** the public edition answers the *static* question ("is this
-> scenario trustworthy?"). Verifying a model's *own arbitrary predictions* against
-> the noise-free ground truth needs the oracle inside the engine, and is *not*
-> shipped here — the tool returns an explicit "not available" instead of a
-> confident guess.
+Zero dependencies (no numpy), no API key, no engine clone. `ERROR` maps to
+`BLOCK`, not to `PROCEED` — a gate that treats "could not evaluate" as "fine" is
+a rubber stamp.
+
+The findings are published, including the ones that go against us: the R² chain
+passes all 62 scenarios, while the **independent wet-lab anchor chain flags two
+of them as physically `CONTRADICTED`** (e.g. `microbio_monod`'s fitted
+`Ks = 0.22 g/L` sits 44× above the literature ceiling for E. coli on glucose).
+Two chains, because one is not enough — details in
+[`references/gate-semantics.md`](skills/vv-gate/references/gate-semantics.md).
+
+**Consumer gotcha worth reading before you write your own client:** Cloudflare
+rejects requests with *no* `User-Agent` and with the stdlib default
+`Python-urllib/3.x` (`403 error code: 1010`). `curl`, `requests`, `node-fetch`,
+`axios`, Go and any explicit UA are fine. So `urllib.request.urlopen(url)` with
+no `Request` is the one thing that fails.
+
 
 ## Install
 
@@ -143,16 +153,36 @@ explicit input schemas and the same honesty-first result contract.
 
 ## Skill catalog
 
-`skills/skill_catalog.json` describes the 4 core Skills that compose a
-SwarmLabs multi-agent workflow:
+`skills/skill_catalog.json` describes the core Skills that compose a SwarmLabs
+multi-agent workflow:
 
 1. **PhysicsPredictSkill** — call the real engine.
 2. **ExperimentDesignSkill** — turn a goal into a parameter plan.
 3. **ActiveLearningSkill** — pick the next most informative experiment point.
 4. **ReportGenerationSkill** — emit an auditable report.
+5. **vv-gate** — Adjudicate a numeric claim against held-out ground truth and
+   literature anchors, and return a blocking gate. This one is a standalone
+   agentskills.io-format Skill (`skills/vv-gate/SKILL.md`), loadable by Claude
+   Code, Cursor, Codex, Gemini CLI and any harness that reads that spec.
 
 These are the building blocks of the SwarmLabs "Planner → Executor →
-Verifier" agent loop.
+Verifier" agent loop. Skills 1–4 are the loop; skill 5 is the thing that can
+refuse it.
+
+## Status — read this before trusting anything above
+
+Honest state of the project, because you are being asked to depend on it:
+
+| Signal | State |
+|---|---|
+| Engineering verifiability | **checkable** — engine/oracle digests are published, `selftest` is live, negative controls are documented |
+| Company entity | **none** (no legal entity) |
+| Bus factor | **1** |
+| Revenue | **pre-revenue** |
+| GitHub stars | **0** |
+
+The engineering is reproducible from your side. The *organisation* is not yet
+proven, and nothing in this repository should be read as implying otherwise.
 
 ## License
 
