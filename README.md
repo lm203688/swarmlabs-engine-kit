@@ -71,11 +71,15 @@ python skills/vv-gate/scripts/vv_gate.py template microbio_monod -o preds.json
 #   ... fill preds.json with your y_pred (and optionally y_std = your 1-sigma)
 python skills/vv-gate/scripts/vv_gate.py verify microbio_monod --pred preds.json
 #   exit 0 = PROCEED | 3 = needs human sign-off | 2 = BLOCK the autonomous action
+#   exit 4 = unreachable (edge block / network) — NO VERDICT was produced
 ```
 
 Zero dependencies (no numpy), no API key, no engine clone. `ERROR` maps to
 `BLOCK`, not to `PROCEED` — a gate that treats "could not evaluate" as "fine" is
-a rubber stamp.
+a rubber stamp. `4` is separate from `2` for the same reason: a gate you cannot
+reach has not ruled against you, and conflating the two leaves an operator
+unable to tell "fix the network" from "stop the work". Alert and retry on `4`;
+halt on `2`.
 
 The findings are published, including the ones that go against us: the R² chain
 passes all 62 scenarios, while the **independent wet-lab anchor chain flags two
@@ -89,6 +93,15 @@ rejects requests with *no* `User-Agent` and with the stdlib default
 `Python-urllib/3.x` (`403 error code: 1010`). `curl`, `requests`, `node-fetch`,
 `axios`, Go and any explicit UA are fine. So `urllib.request.urlopen(url)` with
 no `Request` is the one thing that fails.
+
+**And the block is not deterministic** — the same explicit UA is served on one
+attempt and 403'd on the next. Measured on CI: two *live* jobs in the same
+minute, running byte-identical code, went green and red together, while both
+*offline* jobs stayed green. So a single `1010` is not evidence that the service
+is down, and it is not a verdict. Both shipped clients retry it and, if it
+persists, report **unreachable** (`exit 4`, `unreachable: true`) rather than
+guessing. Do not "fix" it by caching the last verdict or by mapping it to
+success — that turns the gate into decoration.
 
 
 ## Install
